@@ -1,0 +1,19 @@
+{
+  "validatorMode": "default",
+  "checks": {
+    "ordering": "strict"
+  },
+  "filters": {
+    "ignore": [],
+    "allow": [
+      "public/**",
+      "src/**",
+      "views/**",
+      ".env",
+      "safe_scan.js",
+      "server.js",
+      "iterateBlocks.js",
+      "validate_ip.js"
+    ]
+  }
+}

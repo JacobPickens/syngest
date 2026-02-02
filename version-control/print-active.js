@@ -25,15 +25,27 @@ function printActive() {
 
   const a = state.active;
 
-  console.log("Active repo dump");
+  console.log("Active chit dump");
   console.log("----------------");
-  console.log(`Version    : ${a.version}`);
-  if (a.sha256) console.log(`SHA256     : ${a.sha256}`);
-  console.log(`Applied at : ${a.appliedAt}`);
-  console.log(`Files      : ${a.fileCount}`);
+  console.log(`Version         : ${a.version}`);
+  if (a.toolchainVersion) console.log(`Toolchain       : ${a.toolchainVersion}`);
+  console.log(`Applied at      : ${a.appliedAt}`);
+  console.log(`Files           : ${a.fileCount}`);
+  if (Array.isArray(a.manifest)) console.log(`Manifest        : ${a.manifest.length} files tracked`);
+
+  if (a.validatorConfig && typeof a.validatorConfig === "object") {
+    const mode = a.validatorConfig.validatorMode || "default";
+    console.log(`Validator mode  : ${mode}`);
+
+    const checks = a.validatorConfig.checks || {};
+    const strictKeys = Object.keys(checks).filter((k) => checks[k] === "strict");
+    if (strictKeys.length) {
+      console.log(`Strict checks   : ${strictKeys.sort().join(", ")}`);
+    }
+  }
 
   if (Array.isArray(state.history)) {
-    console.log(`History    : ${state.history.length} total applied dumps`);
+    console.log(`History         : ${state.history.length} total applied dumps`);
   }
 }
 
@@ -42,4 +54,3 @@ if (require.main === module) {
 }
 
 module.exports = { printActive };
-
