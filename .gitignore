@@ -3,3 +3,4 @@ node_modules
 dl_data
 data_precomputed
 online.sqlite
+pull.sh

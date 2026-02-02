@@ -1,462 +1,569 @@
-// --- public/js/dashboard.js ---
-(function(){
-  'use strict';
+// --- routes/dashboard.js ---
+// Recovered Express router (server-side) for the dashboard.
+// Provides: page render + tailing output + DB-backed run/rows/stats + in-memory scheduler that can spawn scan script.
+//
+// NOTE: This file is intentionally defensive:
+// - It will NOT interfere with an already-running scan process.
+// - If DB/table names differ, it will fall back gracefully with ok=false + error messages.
 
-  const cfg = (window.__DASH_CFG__ || {});
-  const POLL_ROWS_MS   = Number(cfg.pollRowsMs  || 2000);
-  const POLL_OUT_MS    = Number(cfg.pollOutMs   || 700);
-  const POLL_DBSTAT_MS = Number(cfg.pollStatsMs || 1200);
-  const MAX_ROWS       = Number(cfg.maxRows     || 200);
+'use strict';
 
-  // UI stagger settings (rolling insert feel)
-  const INSERT_STAGGER_MS = 120;     // cadence per new IP
-  const INSERT_BURST_MAX  = 6;       // max queued inserts per poll to avoid giant spikes
+const path = require('path');
+const fs = require('fs');
+const fsp = fs.promises;
+const { spawn } = require('child_process');
+const express = require('express');
 
-  let activeRun = null;
-  let outputResetPending = false;
-  let scheduleState = { nextRunAtMs: null, running: false, startedByDashboard: false, lastExit: null };
+const router = express.Router();
 
-  const el = (id) => document.getElementById(id);
+// ---------------------------
+// Config (env + sensible defaults)
+// ---------------------------
 
-  // ---- DB table state (diff + staggered inserts) ----
-  const rowByIp = new Map();         // ip -> { tr, runTable }
-  const pendingAdds = [];            // queue of { ip, row, runTable }
-  let pendingTimer = null;
+const ROOT = path.resolve(__dirname, '..');
+const DEFAULT_DB_PATH = path.join(ROOT, 'data', 'scan.db');
+const DEFAULT_OUTPUT_PATH = path.join(ROOT, 'output.txt');
 
-  function fmtNum(n){
-    if (n === null || n === undefined) return '—';
-    try { return Number(n).toLocaleString(); } catch { return String(n); }
-  }
+// If you have a dedicated scan script, set SCAN_SCRIPT to it (absolute or relative to project root).
+// Example: SCAN_SCRIPT=./safe_scan.js
+const DB_PATH = process.env.DB_PATH ? path.resolve(ROOT, process.env.DB_PATH) : DEFAULT_DB_PATH;
+const OUTPUT_PATH = process.env.OUTPUT_PATH ? path.resolve(ROOT, process.env.OUTPUT_PATH) : DEFAULT_OUTPUT_PATH;
 
-  function fmtTs(sec){
-    if (!sec) return '—';
-    const d = new Date(sec * 1000);
-    return d.toLocaleString();
-  }
+const NODE_BIN = process.env.NODE_BIN || process.execPath;
+const SCAN_SCRIPT = process.env.SCAN_SCRIPT ? path.resolve(ROOT, process.env.SCAN_SCRIPT) : null;
 
-  function fmtMs(ms){
-    if (!ms) return '—';
-    const s = Math.max(0, Math.floor(ms/1000));
-    const mm = Math.floor(s/60);
-    const ss = s % 60;
-    return mm.toString().padStart(2,'0') + ':' + ss.toString().padStart(2,'0');
-  }
+// These are optional knobs; they only apply to *new* runs started from the dashboard.
+const SCAN_CWD = process.env.SCAN_CWD ? path.resolve(ROOT, process.env.SCAN_CWD) : ROOT;
 
-  function setRunSubtitle(meta){
-    if (!meta) {
-      el('runSub').textContent = 'no runs yet (runs_meta empty)';
-      return;
+// default blocks if not set elsewhere
+let scanNBlocks = Number(process.env.SCAN_N_BLOCKS || 1);
+if (!Number.isFinite(scanNBlocks) || scanNBlocks < 1) scanNBlocks = 1;
+
+// ---------------------------
+// Optional SQLite (best-effort)
+// ---------------------------
+
+let sqlite = null;
+let db = null;
+
+// Support either better-sqlite3 or sqlite3 if installed.
+function tryInitDb() {
+  if (db) return db;
+
+  // better-sqlite3 (sync)
+  try {
+    // eslint-disable-next-line import/no-extraneous-dependencies
+    const BetterSqlite3 = require('better-sqlite3');
+    sqlite = { kind: 'better-sqlite3' };
+    db = new BetterSqlite3(DB_PATH, { readonly: true });
+    return db;
+  } catch (_) {}
+
+  // sqlite3 (async)
+  try {
+    // eslint-disable-next-line import/no-extraneous-dependencies
+    const sqlite3 = require('sqlite3');
+    sqlite = { kind: 'sqlite3', sqlite3 };
+    db = new sqlite3.Database(DB_PATH, sqlite3.OPEN_READONLY);
+    return db;
+  } catch (_) {}
+
+  return null;
+}
+
+function dbAll(sql, params = []) {
+  const dbc = tryInitDb();
+  if (!dbc) return Promise.reject(new Error('No sqlite driver found (install better-sqlite3 or sqlite3)'));
+
+  if (sqlite.kind === 'better-sqlite3') {
+    try {
+      const stmt = dbc.prepare(sql);
+      const rows = stmt.all(params);
+      return Promise.resolve(rows);
+    } catch (e) {
+      return Promise.reject(e);
     }
-    el('runSub').textContent = meta.run_table + ' // ' + meta.source + ' // port ' + meta.port;
   }
 
-  function clearConsole(){ el('console').textContent = ''; }
+  return new Promise((resolve, reject) => {
+    dbc.all(sql, params, (err, rows) => (err ? reject(err) : resolve(rows)));
+  });
+}
 
-  function appendConsole(text){
-    if (!text) return;
-    const c = el('console');
-    const atBottom = (c.scrollTop + c.clientHeight) >= (c.scrollHeight - 12);
-    c.textContent += text;
-    if (atBottom) c.scrollTop = c.scrollHeight;
+function dbGet(sql, params = []) {
+  const dbc = tryInitDb();
+  if (!dbc) return Promise.reject(new Error('No sqlite driver found (install better-sqlite3 or sqlite3)'));
+
+  if (sqlite.kind === 'better-sqlite3') {
+    try {
+      const stmt = dbc.prepare(sql);
+      const row = stmt.get(params);
+      return Promise.resolve(row);
+    } catch (e) {
+      return Promise.reject(e);
+    }
   }
 
-  function applyDbStats(stats){
-    stats = stats || {};
-    el('pUnique').textContent = fmtNum(stats.unique_ips ?? null);
-    el('pObs').textContent    = fmtNum(stats.total_observations ?? null);
-    el('pHot').textContent    = fmtNum(stats.ips_seen_last_60s ?? null);
+  return new Promise((resolve, reject) => {
+    dbc.get(sql, params, (err, row) => (err ? reject(err) : resolve(row)));
+  });
+}
 
-    const first = stats.first_seen_min ? new Date(stats.first_seen_min * 1000) : null;
-    const last  = stats.last_seen_max ? new Date(stats.last_seen_max * 1000) : null;
-    el('pFirst').textContent  = first ? first.toLocaleString() : '—';
-    el('pLast').textContent   = last ? last.toLocaleString() : '—';
+// ---------------------------
+// Tail state for output.txt
+// ---------------------------
+
+const tailState = new Map(); // key -> { pos:number }
+async function readTailChunk(key, reset) {
+  const st = tailState.get(key) || { pos: 0 };
+  if (reset) st.pos = 0;
+
+  let fh;
+  try {
+    fh = await fsp.open(OUTPUT_PATH, 'a+');
+    const stat = await fh.stat();
+    const size = stat.size || 0;
+
+    // if file truncated
+    if (st.pos > size) st.pos = 0;
+
+    const maxChunk = 64 * 1024; // 64kb per poll
+    const start = st.pos;
+    const toRead = Math.min(maxChunk, Math.max(0, size - start));
+
+    let text = '';
+    if (toRead > 0) {
+      const buf = Buffer.alloc(toRead);
+      const { bytesRead } = await fh.read(buf, 0, toRead, start);
+      text = buf.slice(0, bytesRead).toString('utf8');
+      st.pos = start + bytesRead;
+    }
+
+    tailState.set(key, st);
+    return { text };
+  } finally {
+    try { await fh?.close(); } catch (_) {}
+  }
+}
+
+// ---------------------------
+// Scan process + scheduler (in-memory)
+// ---------------------------
+
+const sched = {
+  armed: false,
+  delaySec: null,
+  nextRunAtMs: null,
+  timer: null
+};
+
+let runningProc = null;
+let runningStartedAt = null;
+let startedByDashboard = false;
+
+function isRunning() {
+  return !!runningProc;
+}
+
+async function ensureOutputFile() {
+  try {
+    await fsp.mkdir(path.dirname(OUTPUT_PATH), { recursive: true });
+    await fsp.appendFile(OUTPUT_PATH, '');
+  } catch (_) {}
+}
+
+function spawnScanOnce({ byDashboard }) {
+  if (!SCAN_SCRIPT) {
+    return { ok: false, error: 'SCAN_SCRIPT is not configured (set SCAN_SCRIPT env var)' };
+  }
+  if (runningProc) {
+    return { ok: false, error: 'scan already running' };
   }
 
-  function markRunFresh(){
-    document.body.classList.add('runFresh');
-    setTimeout(() => document.body.classList.remove('runFresh'), 6500);
-  }
+  startedByDashboard = !!byDashboard;
+  runningStartedAt = Date.now();
 
-  async function pollLatestRun(){
-    const r = await fetch('/api/latest-run', { cache: 'no-store' }).then(x => x.json()).catch(() => null);
-    if (!r || !r.ok) return;
+  // Append a run banner
+  ensureOutputFile().then(() => {
+    fs.appendFileSync(
+      OUTPUT_PATH,
+      `\n[dashboard] === RUN START ${new Date().toISOString()} === (SCAN_N_BLOCKS=${scanNBlocks})\n`
+    );
+  }).catch(() => {});
 
-    const meta = r.meta;
-    setRunSubtitle(meta);
+  const env = { ...process.env, SCAN_N_BLOCKS: String(scanNBlocks) };
 
-    if (!meta) return;
+  // Keep scan isolated; DO NOT inherit stdio; we capture and append to output file.
+  const child = spawn(
+    NODE_BIN,
+    [SCAN_SCRIPT],
+    { cwd: SCAN_CWD, env, stdio: ['ignore', 'pipe', 'pipe'] }
+  );
 
-    const runChanged = !!(activeRun && meta.run_table !== activeRun);
+  runningProc = child;
 
-    if (runChanged) {
-      activeRun = meta.run_table;
-      clearConsole();
-      outputResetPending = true;
+  const writeOut = (chunk) => {
+    try {
+      fs.appendFileSync(OUTPUT_PATH, chunk);
+    } catch (_) {}
+  };
 
-      // new run → slightly darker base gray for a moment
-      markRunFresh();
+  child.stdout.on('data', (d) => writeOut(d));
+  child.stderr.on('data', (d) => writeOut(d));
 
-      // mark all existing rows as previous-run
-      for (const [, rec] of rowByIp) {
-        rec.tr.classList.remove('currentRun', 'newIp');
-        rec.tr.classList.add('prevRun');
-        rec.runTable = rec.runTable || 'unknown';
+  child.on('close', (code, signal) => {
+    const ended = new Date().toISOString();
+    const msg = `\n[dashboard] === RUN END ${ended} === code=${code} signal=${signal || 'none'}\n`;
+    try { fs.appendFileSync(OUTPUT_PATH, msg); } catch (_) {}
+    runningProc = null;
+    runningStartedAt = null;
+    startedByDashboard = false;
+
+    // If scheduler still armed, compute the next run again (interval behavior)
+    if (sched.armed && typeof sched.delaySec === 'number' && sched.delaySec > 0) {
+      sched.nextRunAtMs = Date.now() + sched.delaySec * 1000;
+    }
+  });
+
+  return { ok: true };
+}
+
+function clearScheduleTimer() {
+  if (sched.timer) clearInterval(sched.timer);
+  sched.timer = null;
+}
+
+function armScheduler(delaySec) {
+  const d = Number(delaySec);
+  if (!Number.isFinite(d) || d < 1) return { ok: false, error: 'delaySec must be >= 1' };
+
+  sched.armed = true;
+  sched.delaySec = Math.floor(d);
+  sched.nextRunAtMs = Date.now() + sched.delaySec * 1000;
+
+  if (!sched.timer) {
+    sched.timer = setInterval(() => {
+      if (!sched.armed) return;
+      if (isRunning()) return;
+
+      const now = Date.now();
+      if (sched.nextRunAtMs && now >= sched.nextRunAtMs) {
+        // reset terminal on the UI side via /api/tail reset param, not here.
+        spawnScanOnce({ byDashboard: true });
+        // nextRunAtMs will be advanced when process exits; but also set a provisional next tick to avoid rapid-fire
+        sched.nextRunAtMs = now + sched.delaySec * 1000;
       }
+    }, 250);
+  }
 
-      // clear any pending stagger inserts from old run
-      pendingAdds.length = 0;
-    } else if (!activeRun) {
-      activeRun = meta.run_table;
-      clearConsole();
-      outputResetPending = true;
-      markRunFresh();
+  return { ok: true };
+}
+
+function disarmScheduler() {
+  sched.armed = false;
+  sched.delaySec = null;
+  sched.nextRunAtMs = null;
+  clearScheduleTimer();
+  return { ok: true };
+}
+
+function scheduleStatus() {
+  return {
+    armed: !!sched.armed,
+    delaySec: sched.delaySec,
+    nextRunAtMs: sched.nextRunAtMs,
+    running: isRunning(),
+    startedByDashboard: !!startedByDashboard,
+    runningStartedAt
+  };
+}
+
+// ---------------------------
+// Page route (pug render)
+// ---------------------------
+
+router.get(['/', '/dashboard'], async (req, res) => {
+  // We only provide minimal locals; your existing pug should use whatever it needs.
+  // Ensure output file exists (avoid 404s in tail).
+  await ensureOutputFile();
+
+  res.render('dashboard', {
+    cfg: {
+      dbPath: DB_PATH,
+      outputPath: OUTPUT_PATH
+    }
+  });
+});
+
+// ---------------------------
+// Tail endpoint (live console)
+// ---------------------------
+
+// Client expects: { text, source? }
+router.get('/api/tail', async (req, res) => {
+  const key = String(req.query.key || 'global');
+  const reset = String(req.query.reset || '0') === '1';
+
+  try {
+    const { text } = await readTailChunk(key, reset);
+    return res.json({
+      ok: true,
+      text,
+      source: path.basename(OUTPUT_PATH),
+      running: isRunning()
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+// ---------------------------
+// Run + DB endpoints
+// ---------------------------
+
+// Expected by client: /api/run/latest -> { meta, block? , firstEverCreatedAt? }
+router.get('/api/run/latest', async (req, res) => {
+  // Try common patterns:
+  // - runs_meta table with created_at, run_table, source, port
+  // - ip_blocks table with last picked block
+  try {
+    const meta = await dbGet(
+      `SELECT run_table, created_at, source, port
+       FROM runs_meta
+       ORDER BY created_at DESC
+       LIMIT 1`
+    ).catch(() => null);
+
+    const firstEver = await dbGet(
+      `SELECT MIN(created_at) AS first_ever_created_at FROM runs_meta`
+    ).catch(() => null);
+
+    const block = await dbGet(
+      `SELECT ip_block, picked_at, ip_block_namespace, ip_block_file
+       FROM ip_blocks
+       ORDER BY picked_at DESC
+       LIMIT 1`
+    ).catch(() => null);
+
+    return res.json({
+      meta: meta || null,
+      block: block || null,
+      firstEverCreatedAt: firstEver ? firstEver.first_ever_created_at : null
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+// Expected by client: /api/run/:run/stats -> stats object
+router.get('/api/run/:run/stats', async (req, res) => {
+  const run = String(req.params.run || '');
+  if (!run) return res.status(400).json({ ok: false, error: 'missing run' });
+
+  // This is best-effort; adjust table names if yours differ.
+  // stats expected by client:
+  // unique_ips, total_observations, hot_unique_ips, first_seen, last_seen
+  try {
+    // rows table is assumed to be run-specific (table name = run_table) OR a shared table keyed by run_table.
+    // We'll try run-named table first, then fallback.
+    let rowTable = run.replace(/[^a-zA-Z0-9_]/g, '');
+    if (!rowTable) rowTable = run;
+
+    let stats = null;
+
+    // Attempt: run table exists with ip, first_seen, last_seen
+    try {
+      const base = await dbGet(
+        `SELECT
+           COUNT(DISTINCT ip) AS unique_ips,
+           COUNT(1) AS total_observations,
+           MIN(first_seen) AS first_seen,
+           MAX(last_seen) AS last_seen
+         FROM "${rowTable}"`
+      );
+
+      // hot_unique_ips: seen within last 60s
+      const nowSec = Math.floor(Date.now() / 1000);
+      const hot = await dbGet(
+        `SELECT COUNT(DISTINCT ip) AS hot_unique_ips
+         FROM "${rowTable}"
+         WHERE last_seen >= ?`,
+        [nowSec - 60]
+      );
+
+      stats = {
+        unique_ips: base?.unique_ips ?? 0,
+        total_observations: base?.total_observations ?? 0,
+        hot_unique_ips: hot?.hot_unique_ips ?? 0,
+        first_seen: base?.first_seen ?? null,
+        last_seen: base?.last_seen ?? null
+      };
+    } catch (_) {
+      // Fallback: shared table online_ips keyed by run_table
+      const base = await dbGet(
+        `SELECT
+           COUNT(DISTINCT ip) AS unique_ips,
+           SUM(seen_count) AS total_observations,
+           MIN(first_seen) AS first_seen,
+           MAX(last_seen) AS last_seen
+         FROM online_ips
+         WHERE run_table = ?`,
+        [run]
+      ).catch(() => null);
+
+      const nowSec = Math.floor(Date.now() / 1000);
+      const hot = await dbGet(
+        `SELECT COUNT(DISTINCT ip) AS hot_unique_ips
+         FROM online_ips
+         WHERE run_table = ? AND last_seen >= ?`,
+        [run, nowSec - 60]
+      ).catch(() => null);
+
+      stats = {
+        unique_ips: base?.unique_ips ?? 0,
+        total_observations: base?.total_observations ?? 0,
+        hot_unique_ips: hot?.hot_unique_ips ?? 0,
+        first_seen: base?.first_seen ?? null,
+        last_seen: base?.last_seen ?? null
+      };
     }
 
-    el('mRun').textContent = meta.run_table;
-    el('mSource').textContent = meta.source;
-    el('mPort').textContent = meta.port;
-    el('mCreated').textContent = new Date(meta.created_at * 1000).toLocaleString();
+    return res.json(stats || { unique_ips: 0, total_observations: 0, hot_unique_ips: 0, first_seen: null, last_seen: null });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
 
-    const block = r.block;
-    if (block && block.ip_block) {
-      el('mBlock').textContent = block.ip_block;
-      el('mBlockMeta').textContent =
-        'picked_at=' + new Date(block.picked_at * 1000).toLocaleString() +
-        ' // ns=' + block.ip_block_namespace +
-        ' // file=' + block.ip_block_file;
-    } else {
-      el('mBlock').textContent = '—';
-      el('mBlockMeta').textContent = '';
+// Expected by client: /api/run/:run/rows?limit=50 -> array of rows
+router.get('/api/run/:run/rows', async (req, res) => {
+  const run = String(req.params.run || '');
+  const limit = clamp(Number(req.query.limit || 50), 1, 500);
+
+  if (!run) return res.status(400).json({ ok: false, error: 'missing run' });
+
+  try {
+    let rowTable = run.replace(/[^a-zA-Z0-9_]/g, '');
+    if (!rowTable) rowTable = run;
+
+    // Prefer run-named table
+    try {
+      const rows = await dbAll(
+        `SELECT
+           ip,
+           port,
+           source,
+           first_seen,
+           last_seen,
+           COALESCE(seen_count, 1) AS seen_count,
+           "${run}" AS _run
+         FROM "${rowTable}"
+         ORDER BY last_seen DESC
+         LIMIT ?`,
+        [limit]
+      );
+
+      return res.json(Array.isArray(rows) ? rows : []);
+    } catch (_) {
+      // Fallback shared table
+      const rows = await dbAll(
+        `SELECT
+           ip,
+           port,
+           source,
+           first_seen,
+           last_seen,
+           seen_count,
+           run_table AS _run
+         FROM online_ips
+         WHERE run_table = ?
+         ORDER BY last_seen DESC
+         LIMIT ?`,
+        [run, limit]
+      ).catch(() => []);
+
+      return res.json(Array.isArray(rows) ? rows : []);
     }
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
+});
 
-  function buildRowHTML(row){
-    return `
-      <td title="${row.ip}">${row.ip}</td>
-      <td>${fmtNum(row.seen_count)}</td>
-      <td>${fmtTs(row.last_seen)}</td>
-      <td>${fmtTs(row.first_seen)}</td>
-      <td title="${row.source}">${row.source}</td>
-      <td>${row.port}</td>
-    `;
+// ---------------------------
+// Scheduler endpoints
+// ---------------------------
+
+// Client expects: /api/schedule/status -> { armed, delaySec, nextRunAtMs, running, ... }
+router.get('/api/schedule/status', (req, res) => {
+  const reset = String(req.query.reset || '0') === '1';
+  if (reset) {
+    // when UI wants a clean countdown baseline, just respond with current state
   }
+  res.json(scheduleStatus());
+});
 
-  function clampTableSize(){
-    const tb = el('rowsBody');
-    if (!tb) return;
-    const rows = tb.querySelectorAll('tr.ipRow');
-    if (rows.length <= MAX_ROWS) return;
+// POST { delaySec }
+router.post('/api/schedule/arm', express.json(), async (req, res) => {
+  await ensureOutputFile();
 
-    const over = rows.length - MAX_ROWS;
-    for (let i = 0; i < over; i++) {
-      const tr = rows[rows.length - 1 - i];
-      const ip = tr && tr.getAttribute('data-ip');
-      if (ip) rowByIp.delete(ip);
-      tr.remove();
-    }
+  const delaySec = req.body && req.body.delaySec;
+  const out = armScheduler(delaySec);
+  if (!out.ok) return res.status(400).json(out);
+
+  // Log schedule change
+  try {
+    fs.appendFileSync(
+      OUTPUT_PATH,
+      `[dashboard] scheduler armed: delaySec=${sched.delaySec} next=${new Date(sched.nextRunAtMs).toISOString()}\n`
+    );
+  } catch (_) {}
+
+  res.json(scheduleStatus());
+});
+
+router.post('/api/schedule/disarm', async (req, res) => {
+  await ensureOutputFile();
+  disarmScheduler();
+
+  try {
+    fs.appendFileSync(OUTPUT_PATH, `[dashboard] scheduler disarmed\n`);
+  } catch (_) {}
+
+  res.json(scheduleStatus());
+});
+
+router.post('/api/schedule/run-now', async (req, res) => {
+  await ensureOutputFile();
+
+  // Do not interfere with running scan
+  if (isRunning()) return res.status(409).json({ ok: false, error: 'scan already running' });
+
+  const out = spawnScanOnce({ byDashboard: true });
+  if (!out.ok) return res.status(400).json(out);
+
+  res.json(scheduleStatus());
+});
+
+// ---------------------------
+// Optional: allow UI to update scan blocks count (styling-only elsewhere)
+// ---------------------------
+
+router.get('/api/config', (req, res) => {
+  res.json({ ok: true, scanNBlocks });
+});
+
+router.post('/api/config/scan-n-blocks', express.json(), async (req, res) => {
+  const n = Number(req.body && req.body.nBlocks);
+  if (!Number.isFinite(n) || n < 1 || n > 100000) {
+    return res.status(400).json({ ok: false, error: 'nBlocks must be a number >= 1' });
   }
+  scanNBlocks = Math.floor(n);
 
-  function ensurePendingTimer(){
-    if (pendingTimer) return;
-    pendingTimer = setInterval(() => {
-      const tb = el('rowsBody');
-      if (!tb) return;
+  await ensureOutputFile();
+  try {
+    fs.appendFileSync(OUTPUT_PATH, `[dashboard] SCAN_N_BLOCKS set to ${scanNBlocks}\n`);
+  } catch (_) {}
 
-      if (pendingAdds.length === 0) {
-        clearInterval(pendingTimer);
-        pendingTimer = null;
-        return;
-      }
+  res.json({ ok: true, scanNBlocks });
+});
 
-      const item = pendingAdds.shift();
-      if (!item) return;
-
-      // if it somehow already exists now, skip
-      if (rowByIp.has(item.ip)) return;
-
-      const tr = document.createElement('tr');
-      tr.className = 'ipRow currentRun newIp';
-      tr.setAttribute('data-ip', item.ip);
-      tr.setAttribute('data-run', item.runTable);
-      tr.innerHTML = buildRowHTML(item.row);
-
-      // prepend => pushes list down (rolling effect)
-      const firstRow = tb.firstChild;
-      tb.insertBefore(tr, firstRow);
-
-      // remove newIp class after glow finishes
-      setTimeout(() => tr.classList.remove('newIp'), 1300);
-
-      rowByIp.set(item.ip, { tr, runTable: item.runTable });
-
-      clampTableSize();
-    }, INSERT_STAGGER_MS);
-  }
-
-  async function pollRows(){
-    if (!activeRun) return;
-
-    const r = await fetch('/api/rows?run=' + encodeURIComponent(activeRun) + '&limit=' + MAX_ROWS, { cache: 'no-store' })
-      .then(x => x.json()).catch(() => null);
-    if (!r || !r.ok) return;
-
-    const rows = r.rows || [];
-    const tb = el('rowsBody');
-    if (!tb) return;
-
-    if (!rows.length && rowByIp.size === 0) {
-      tb.innerHTML = '<tr><td colspan="6" class="small">no rows yet…</td></tr>';
-      return;
-    } else {
-      const placeholder = tb.querySelector('tr td.small[colspan="6"]');
-      if (placeholder) tb.innerHTML = '';
-    }
-
-    // mark “present in current run snapshot”
-    const seenThisPoll = new Set();
-
-    // queue new IPs (staggered insertion)
-    let queuedThisPoll = 0;
-
-    for (const row of rows) {
-      const ip = row.ip;
-      if (!ip) continue;
-      seenThisPoll.add(ip);
-
-      const existing = rowByIp.get(ip);
-
-      if (!existing) {
-        // if already queued, skip
-        const alreadyQueued = pendingAdds.some(x => x.ip === ip);
-        if (!alreadyQueued && queuedThisPoll < INSERT_BURST_MAX) {
-          pendingAdds.push({ ip, row, runTable: activeRun });
-          queuedThisPoll++;
-        }
-        continue;
-      }
-
-      // update existing row (in place)
-      existing.runTable = activeRun;
-      existing.tr.classList.remove('prevRun');
-      existing.tr.classList.add('currentRun');
-      existing.tr.setAttribute('data-run', activeRun);
-      existing.tr.innerHTML = buildRowHTML(row);
-    }
-
-    // Start stagger loop if needed
-    if (pendingAdds.length) ensurePendingTimer();
-
-    // anything not in current snapshot becomes prevRun
-    for (const [ip, rec] of rowByIp) {
-      if (rec.runTable === activeRun && !seenThisPoll.has(ip)) {
-        rec.tr.classList.remove('currentRun', 'newIp');
-        rec.tr.classList.add('prevRun');
-      } else if (rec.runTable !== activeRun) {
-        rec.tr.classList.remove('currentRun', 'newIp');
-        rec.tr.classList.add('prevRun');
-      }
-    }
-
-    clampTableSize();
-  }
-
-  async function pollDbStats(){
-    if (!activeRun) return;
-    const r = await fetch('/api/stats?run=' + encodeURIComponent(activeRun), { cache: 'no-store' })
-      .then(x => x.json()).catch(() => null);
-    if (!r || !r.ok) return;
-    applyDbStats(r.stats);
-  }
-
-  async function pollOutput(){
-    const reset = outputResetPending ? '&reset=1' : '';
-    const r = await fetch('/api/output?key=ui' + reset, { cache: 'no-store' })
-      .then(x => x.json()).catch(() => null);
-
-    if (outputResetPending) outputResetPending = false;
-    if (!r || !r.ok) return;
-
-    const running = !!r.running;
-    if (r.text) appendConsole(r.text);
-
-    el('termState').textContent = running ? 'RUNNING' : 'IDLE';
-    el('consoleHint').textContent = running ? 'scan running' : 'polling…';
-
-    scheduleState.running = running;
-    el('lastUpdateTag').textContent = 'updated ' + new Date().toLocaleTimeString();
-  }
-
-  async function fetchConfig(){
-    const r = await fetch('/api/config', { cache: 'no-store' }).then(x => x.json()).catch(() => null);
-    if (!r || !r.ok) return;
-    const v = (r.config && r.config.scanNBlocks) ? Number(r.config.scanNBlocks) : null;
-    if (v && document.getElementById('nBlocks')) document.getElementById('nBlocks').value = v;
-  }
-
-  async function setBlocks(){
-    const inp = document.getElementById('nBlocks');
-    if (!inp) return;
-    const n = Number(inp.value);
-    const r = await fetch('/api/config/scan-n-blocks', {
-      method:'POST',
-      headers:{'content-type':'application/json'},
-      body: JSON.stringify({ nBlocks: n })
-    }).then(x => x.json()).catch(() => null);
-    if (!r) return;
-    if (!r.ok) alert(r.error || 'set failed');
-  }
-
-  async function fetchSchedule(){
-    const r = await fetch('/api/schedule', { cache: 'no-store' }).then(x => x.json()).catch(() => null);
-    if (!r || !r.ok) return;
-    scheduleState = r.status || scheduleState;
-    updateScheduleUi();
-  }
-
-  function updateScheduleUi(){
-    const sched = document.querySelector('.sched');
-    if (!sched) return;
-
-    const running = !!scheduleState.running;
-    sched.classList.toggle('isRunning', running);
-
-    let stateTxt = running ? 'RUNNING' : 'IDLE';
-    if (!running && scheduleState.nextRunAtMs) stateTxt = 'ARMED';
-    el('schedState').textContent = stateTxt;
-
-    const cd = el('countdown');
-    if (!cd) return;
-
-    if (running) { cd.textContent = '—'; return; }
-    if (!scheduleState.nextRunAtMs) { cd.textContent = '—'; return; }
-
-    cd.textContent = fmtMs(scheduleState.nextRunAtMs - Date.now());
-  }
-
-  async function armSchedule(){
-    const vMin = Number(el('delayMin').value);
-    const delaySec = Math.round(vMin * 60);
-    const r = await fetch('/api/schedule/arm', {
-      method:'POST',
-      headers:{'content-type':'application/json'},
-      body: JSON.stringify({ delaySec })
-    }).then(x => x.json()).catch(() => null);
-    if (!r) return;
-    if (!r.ok) alert(r.error || 'arm failed');
-    scheduleState = r.status || scheduleState;
-    updateScheduleUi();
-  }
-
-  async function cancelSchedule(){
-    const r = await fetch('/api/schedule/cancel', { method:'POST' }).then(x => x.json()).catch(() => null);
-    if (!r || !r.ok) return;
-    scheduleState = r.status || scheduleState;
-    updateScheduleUi();
-  }
-
-  async function runNow(){
-    const r = await fetch('/api/schedule/run-now', { method:'POST' }).then(x => x.json()).catch(() => null);
-    if (!r) return;
-    if (!r.ok) alert(r.error || 'run-now failed');
-    scheduleState = r.status || scheduleState;
-    updateScheduleUi();
-  }
-
-  function wireButtons(){
-    const resetBtn = el('btnResetConsole');
-    const bottomBtn = el('btnScrollBottom');
-    if (resetBtn) resetBtn.addEventListener('click', () => { clearConsole(); outputResetPending = true; });
-    if (bottomBtn) bottomBtn.addEventListener('click', () => { const c = el('console'); c.scrollTop = c.scrollHeight; });
-
-    const armBtn = el('btnArm');
-    const cancelBtn = el('btnCancel');
-    const runNowBtn = el('btnRunNow');
-    if (armBtn) armBtn.addEventListener('click', armSchedule);
-    if (cancelBtn) cancelBtn.addEventListener('click', cancelSchedule);
-    if (runNowBtn) runNowBtn.addEventListener('click', runNow);
-
-    const setBtn = document.getElementById('btnSetBlocks');
-    if (setBtn) setBtn.addEventListener('click', setBlocks);
-  }
-
-  function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
-
-  async function doPulseBurst(){
-    const repeats = 1 + Math.floor(Math.random() * 4);
-    const btns = Array.from(document.querySelectorAll('button'));
-    const pills = Array.from(document.querySelectorAll('.hdrPills .pill, .pill'));
-
-    for (let i = 0; i < repeats; i++) {
-      document.body.classList.add('gridPulse');
-
-      const pickCount = Math.max(1, Math.min(btns.length, 2 + Math.floor(Math.random() * 4)));
-      const pickedBtns = btns.slice().sort(() => Math.random() - 0.5).slice(0, pickCount);
-      pickedBtns.forEach(b => b.classList.add('btnPulse'));
-
-      const pillCount = Math.max(2, Math.min(pills.length, 2 + Math.floor(Math.random() * 4)));
-      const pickedPills = pills.slice().sort(() => Math.random() - 0.5).slice(0, pillCount);
-      pickedPills.forEach(p => p.classList.add('pillPulse'));
-
-      await sleep(260 + Math.floor(Math.random() * 180));
-
-      document.body.classList.remove('gridPulse');
-      pickedBtns.forEach(b => b.classList.remove('btnPulse'));
-      pickedPills.forEach(p => p.classList.remove('pillPulse'));
-
-      if (i < repeats - 1) await sleep(240 + Math.floor(Math.random() * 320));
-    }
-  }
-
-  function startRandomPulseLoop(){
-    const tick = async () => {
-      await doPulseBurst();
-      const next = 25000 + Math.floor(Math.random() * 30000);
-      setTimeout(tick, next);
-    };
-    const first = 8000 + Math.floor(Math.random() * 7000);
-    setTimeout(tick, first);
-  }
-
-  async function doFuzzDisconnect(){
-    document.body.classList.add('fuzzOn');
-    await sleep(4000);
-    document.body.classList.remove('fuzzOn');
-  }
-
-  function startRareFuzzLoop(){
-    const tick = async () => {
-      const next = (180000 + Math.floor(Math.random() * 180000)); // 3–6 min
-      if (Math.random() < 0.40) await doFuzzDisconnect();
-      setTimeout(tick, next);
-    };
-    const first = 90000 + Math.floor(Math.random() * 90000);
-    setTimeout(tick, first);
-  }
-
-  async function boot(){
-    wireButtons();
-
-    await pollLatestRun();
-    setInterval(pollLatestRun, 1500);
-
-    setInterval(pollRows, POLL_ROWS_MS);
-    setInterval(pollOutput, POLL_OUT_MS);
-    setInterval(fetchSchedule, 1000);
-    setInterval(pollDbStats, POLL_DBSTAT_MS);
-
-    pollRows();
-    pollOutput();
-    fetchSchedule();
-    fetchConfig();
-    pollDbStats();
-
-    startRandomPulseLoop();
-    startRareFuzzLoop();
-  }
-
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', boot);
-  } else {
-    boot();
-  }
-})();
+module.exports = router;
