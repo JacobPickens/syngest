@@ -1,0 +1,169 @@
+diff --git a/views/dashboard.pug b/views/dashboard.pug
+--- a/views/dashboard.pug
++++ b/views/dashboard.pug
+@@ -1,57 +1,59 @@
+ extends layout
+   block content
+-    .wrap
+-      header.header
++    main
++      header.hdrTop
+         .title
+           span.dot
+           .tcopy
+             .tmain SCAN DASH // LIVE VIEW
+             .subtitle
+               span#hdrLastBlock Last block: —
+               br
+               span#hdrLastTime Last scan: —
+               br
+               span#hdrFirstEver First scrape: —
+ 
+-        .pills
+-          .pill
+-            span.label UNIQUE
+-            span.value#pUnique 0
+-          .pill
+-            span.label OBS
+-            span.value#pObs 0
+-          .pill
+-            span.label HOT
+-            span.value#pHot 0
++        .hdrMeta
++          .hdrPills
++            .pill
++              span.label UNIQUE
++              span.value#pUnique 0
++            .pill
++              span.label OBS
++              span.value#pObs 0
++            .pill
++              span.label HOT
++              span.value#pHot 0
+ 
+       .grid
+-        .panel.terminal
+-          .panelHeader
+-            span.panelTitle TERMINAL
+-            span.panelRight#termMeta —
++        .card.terminal
++          .consoleTop
++            span.mono TERMINAL
++            span.tag#termMeta —
+           pre.console#console
+ 
+-        .panel.sched
+-          .schedHead
+-            .hleft
+-              | NEXT SCAN
+-              span.mono#countdown(style="margin-left:10px") —
+-            .tag#schedState —
+-          .schedBody
+-            .row
+-              label(for="delayMin") delay_minutes
+-              input#delayMin(type="number" min="1" step="1" value="15")
+-            .row
+-              button#armBtn Arm
+-              button#cancelBtn.secondary Cancel
+-              button#runNowBtn.ghost Run now
+-
+-        .panel.results
+-          .panelHeader
+-            span.panelTitle RESULTS
+-            span.panelRight#runMeta —
+-          .tableWrap
+-            table.table
+-              thead
+-                tr
+-                  th IP
+-                  th LAST SEEN
+-                  th SEEN
+-              tbody#rowsBody
+-                tr
+-                  td(colspan="3").muted waiting…
++        .rightCol
++          .card.sched
++            .cardHead
++              .mono NEXT SCAN
++              .tag#schedState —
++            .meta
++              .row
++                label(for="delayMin") delay_minutes
++                input#delayMin(type="number" min="1" step="1" value="15")
++              .row
++                button#armBtn.btn-warn Arm
++                button#cancelBtn.btn-danger Cancel
++                button#runNowBtn.btn-run Run now
++              .small
++                span.mono#countdown —
++
++          .card.results
++            .cardHead
++              span.mono RESULTS
++              span.tag#runMeta —
++            .tableWrap
++              table.table
++                thead
++                  tr
++                    th IP
++                    th LAST SEEN
++                    th SEEN
++                tbody#rowsBody
++                  tr
++                    td(colspan="3").muted waiting…
+
+diff --git a/public/css/terminal.css b/public/css/terminal.css
+--- a/public/css/terminal.css
++++ b/public/css/terminal.css
+@@ -1,5 +1,4 @@
+ /* --- public/css/terminal.css --- */
+-/* :contentReference[oaicite:1]{index=1} */
+ :root{
+   --bg:#050611;
+   --panel:#070a1b;
+@@
+ .grid{
+   display:grid;
+-  grid-template-columns: 520px 1fr;
++  grid-template-columns: 1fr 520px;
+   gap:14px;
+   align-items:start;
+ }
+ @media (max-width: 1000px){
+   .grid{ grid-template-columns: 1fr; }
+ }
+ 
+-.card{
++.rightCol{
++  display:flex;
++  flex-direction:column;
++  gap:14px;
++}
++
++.card,
++.panel{
+   border:1px solid rgba(255,255,255,.16);
+   background:
+     radial-gradient(900px 260px at 20% -10%, rgba(45,255,223,.10), transparent 55%),
+     radial-gradient(900px 260px at 110% 0%, rgba(255,45,247,.08), transparent 55%),
+     linear-gradient(180deg, rgba(7,10,27,.96), rgba(3,4,14,.96));
+   border-radius:16px;
+   overflow:hidden;
+   position:relative;
+   backdrop-filter: blur(12px);
+   isolation:isolate;
+   box-shadow:
+     0 18px 70px rgba(0,0,0,.68),
+     0 0 0 1px rgba(0,0,0,.22) inset,
+     0 0 26px rgba(45,255,223,.08),
+     0 0 18px rgba(255,45,247,.06);
+ }
+ 
+-.cardHead{
++.cardHead,
++.panelHeader{
+   padding:12px 14px;
+   border-bottom:1px solid rgba(255,255,255,.12);
+   display:flex; align-items:center; justify-content:space-between; gap:10px;
+   font-family:var(--mono);
+ }

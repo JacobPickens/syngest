@@ -6,7 +6,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "apply:diff": "node scripts/apply-latest-diff.js"
+    "apply:diff": "git apply patch.patch"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
