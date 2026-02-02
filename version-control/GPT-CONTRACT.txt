@@ -1,184 +1,215 @@
-CHIT DUMPS — AUTHORITATIVE RULE-SETTING COMMAND
-(Use this as the sole contract in a fresh ChatGPT instance. Ignore GitHub, prior uploads, and any other version control rules.)
+CHIT DUMP SYSTEM — GPT EXECUTION CONTRACT (ZIP-ENFORCED)
 
-You are operating a dump-based snapshot system called **chit dumps**. The dump file (dump.txt) is the ONLY source of truth. All multi-file changes MUST be delivered as a single downloadable dump.txt that can be parsed and applied deterministically.
+This document is the authoritative execution contract for the
+CHIT DUMP snapshot system. It defines how ChatGPT MUST interpret,
+process, modify, and return code.
 
-============================================================
-1) OUTPUT RULE (WHAT YOU MUST RETURN)
-============================================================
-When I request a multi-file change:
-
-- Output ONLY a downloadable file named: dump.txt
-- Do NOT paste the full dump contents inline in chat.
-- You may describe what changed in normal chat, but the dump itself must only be provided as the downloadable file.
+This contract is absolute. No prior conversation, memory, repository,
+or external context may override it.
 
 ============================================================
-2) DUMP FILE FORMAT (HOW TO GENERATE dump.txt)
+1) SOURCE OF TRUTH (ABSOLUTE)
 ============================================================
-A dump.txt is a single text file made of ordered sections. Each section begins with a boundary line:
 
----<section_name>---
-<section content, verbatim>
+When a file named:
 
-Boundaries:
-- Boundary lines must start at column 1.
-- section_name must be a single line (no newlines).
-- Section content is everything until the next boundary line.
+  dump_vX.Y.Z.zip
 
-The dump MUST contain sections in this order:
+is uploaded, it is the ONLY source of truth.
 
-(1) Embedded ignore rules (ALWAYS FIRST)
----__CHITIGNORE__---
-(verbatim contents of .chitignore, LF line endings)
+ChatGPT MUST:
+- Ignore all prior context
+- Ignore any previously discussed code
+- Treat the uploaded ZIP as the complete and authoritative codebase
 
-.chitignore semantics:
-- Works like .gitignore: patterns, globs (*, ?, **), leading / for root-anchored, trailing / for directories, ! to re-include.
-- The dump includes ALL repo files by default EXCEPT those ignored by .chitignore.
-- Hard excludes still apply even if re-included:
-  - middleware/fingerer.js
-  - node_modules/, .git/, versions/, .repo_state.json, dump.txt
+============================================================
+2) ZIP FORMAT (REQUIRED)
+============================================================
 
-(2) Embedded validator config (ALWAYS SECOND)
----__CHITCONFIG__---
-(verbatim contents of .chitconfig, LF line endings)
+The uploaded ZIP MUST contain exactly ONE top-level directory:
 
-.chitconfig schema (JSON):
+  dump_vX.Y.Z/
+
+Inside that directory MUST be:
+
+- dump.meta.json          (REQUIRED, authoritative instructions)
+- dump.part_XXXX.txt      (one or more parts)
+
+No other files or directories are permitted.
+
+If the ZIP does not meet this structure, ChatGPT MUST refuse to proceed.
+
+============================================================
+3) dump.meta.json (AUTHORITATIVE)
+============================================================
+
+dump.meta.json is the first file ChatGPT MUST read.
+
+It defines:
+- format identifier
+- dump version
+- toolchain version
+- ordered list of part files
+- processing instructions
+
+Example required fields:
+
 {
-  "validatorMode": "default" | "strict",
-  "checks": {
-    "<checkId>": "default" | "strict"
+  "format": "chitdump-multipart-v1",
+  "transport": "zip",
+  "version": "vX.Y.Z",
+  "toolchainVersion": "vA.B.C",
+  "parts": [
+    "dump.part_0001.txt",
+    "dump.part_0002.txt"
+  ],
+  "instructions": {
+    "howToUse": [
+      "Unzip the archive",
+      "Read dump.meta.json first",
+      "Process dump parts in listed order",
+      "Each part contains FILE blocks",
+      "Each FILE block is base64 + gzip JSON: { path, content }"
+    ]
   }
 }
 
-Meaning:
-- validatorMode="default": current behavior; warnings remain warnings unless a specific check is set to "strict".
-- validatorMode="strict": ALL warnings become errors except checks explicitly set to "default".
-
-Supported checkIds (warning-only checks that can be promoted):
-- configInvalidJson
-- localChitignoreDiff
-- localChitconfigDiff
-- toolchainVersionMismatch
-- ordering
-- ignoredFilesPresent
-- missingToolchainVersionField
-
-Notes:
-- Structural correctness remains hard errors regardless of config:
-  missing required sections, missing required embedded scripts, forbidden files, sha256 mismatch, manifest mismatch, duplicate boundaries, files after README, etc.
-
-(3) Embedded dump toolchain scripts (ALWAYS NEXT; fixed order)
----__DUMP_SCRIPTS__/generate-dump.js---
----__DUMP_SCRIPTS__/dump-validator.js---
----__DUMP_SCRIPTS__/dump-apply.js---
----__DUMP_SCRIPTS__/dump-undo.js---
----__DUMP_SCRIPTS__/print-active.js---
-(verbatim, LF line endings)
-
-(4) Repo file sections (NEXT; LEXICOGRAPHICALLY ORDERED)
-- After toolchain sections, include repo files as:
-  ---path/within/repo.ext---
-  <full file contents>
-- Repo file sections MUST be lexicographically ordered by their path (ASCII/byte order).
-- EXCLUDE ALWAYS:
-  - middleware/fingerer.js
-- Also never include managed/toolchain files as repo sections:
-  - .chitignore
-  - .chitconfig
-  - scripts/generate-dump.js
-  - scripts/dump-validator.js
-  - scripts/dump-apply.js
-  - scripts/dump-undo.js
-  - scripts/print-active.js
-
-(5) Optional README section (if present, MUST be after all repo files)
----README---
-(markdown)
-
-(6) Meta footer (ALWAYS LAST)
----__META__---
-(JSON object)
+ChatGPT MUST follow dump.meta.json exactly.
 
 ============================================================
-3) __META__ FOOTER (REQUIRED FIELDS + CHECKS)
+4) DUMP PART FORMAT
 ============================================================
-The __META__ JSON MUST include:
 
-- "version": string (e.g. "v1.2.3")
-- "toolchainVersion": string
-- "manifest": array of strings
-- "sha256": string (hex)
+Each dump.part_XXXX.txt contains one or more FILE blocks.
 
-Manifest rules:
-- manifest MUST list ONLY the repo file section names (group #4),
-  in the exact order they appear in the dump.
-- manifest MUST NOT include __CHITIGNORE__, __CHITCONFIG__, __DUMP_SCRIPTS__/..., README, or __META__.
+FILE blocks are delimited by the exact line:
 
-SHA256 rules (deterministic):
-- sha256 is SHA-256 (hex) of the exact bytes from the beginning of the file
-  up to (and including) the line: "---__META__---\n"
-- Use LF newlines in generated dumps.
+  ---FILE---
 
-============================================================
-4) APPLY/PARSE SEMANTICS (HOW dump.txt IS CONSUMED)
-============================================================
-When applying a dump:
+Each FILE block is:
+- base64 encoded
+- gzip compressed
+- JSON with the structure:
 
-A) Toolchain self-consistency
-- The embedded .chitignore, .chitconfig, and toolchain scripts are authoritative.
-- Applying a dump MUST overwrite local:
-  - .chitignore (from __CHITIGNORE__)
-  - .chitconfig (from __CHITCONFIG__)
-  - scripts/*.js toolchain files (from __DUMP_SCRIPTS__/...)
+{
+  "path": "<relative/path/within/project>",
+  "content": "<full file contents>"
+}
 
-B) Refactors / deletions must be handled
-- Track the manifest of the last applied dump.
-- When applying a new dump, any file that was in the previous manifest but is not present in the new manifest
-  should be deleted from the working tree (so renames/splits don’t leave stale files behind).
-- Never delete ignored system areas (node_modules/, .git/, versions/) or toolchain/managed files.
+ChatGPT MUST:
+- Decode base64
+- Gunzip
+- Parse JSON
+- Reconstruct files exactly at the specified paths
 
 ============================================================
-5) VALIDATION RULES (WHAT MAKES A DUMP INVALID)
+5) USER TRIGGER PHRASE
 ============================================================
-Hard invalid:
-- Missing __CHITIGNORE__ first section
-- Missing __CHITCONFIG__ second section
-- Missing any required __DUMP_SCRIPTS__ section
-- Any repo file section appears after README
-- Missing __META__ footer or invalid JSON
-- Missing required __META__ fields: version, manifest, sha256 (toolchainVersion required by current rules)
-- sha256 mismatch
-- manifest does not match repo file sections exactly (names + order)
-- middleware/fingerer.js appears as a repo file section or in manifest
-- duplicate boundaries for same file
-- managed/toolchain files appear as repo sections
 
-Warnings (promotable via .chitconfig):
-- ordering
-- ignoredFilesPresent
-- toolchainVersionMismatch
-- localChitignoreDiff / localChitconfigDiff
-- configInvalidJson
-- missingToolchainVersionField
+If the user uploads a dump ZIP and says:
+
+  "this is the code"
+
+That instruction is COMPLETE.
+
+ChatGPT MUST:
+- Unzip the archive conceptually
+- Load dump.meta.json
+- Reconstruct the full codebase
+- Proceed without asking questions
+
+ChatGPT MUST NOT request clarification.
 
 ============================================================
-6) OPERATOR QUICKSTART (CLI INTENT)
+6) CHANGE REQUEST HANDLING
 ============================================================
-Assume a Node.js CLI exists (or will exist) with these commands:
 
-- chit-dumps generate --version=vX.Y.Z
-  - writes versions/dump_vX.Y.Z.txt
-  - embeds __CHITIGNORE__, __CHITCONFIG__, __DUMP_SCRIPTS__
-  - lexicographic repo file sections
-  - computes __META__.sha256 and writes __META__ {version, toolchainVersion, manifest, sha256}
+When the user requests changes to the code:
 
-- chit-dumps apply dump.txt
-  - validates sha256 + manifest exact match + structure
-  - overwrites local .chitignore/.chitconfig/toolchain scripts from embedded sections
-  - applies repo files
-  - deletes stale files from previous manifest
+- ChatGPT MUST base all changes solely on the reconstructed dump
+- ChatGPT MUST NOT invent, omit, or assume files
+- ChatGPT MUST explain changes in plain language
 
-- chit-dumps active
-  - prints active version/toolchain/appliedAt/fileCount/manifest length + validator config summary
+============================================================
+7) RETURN ARTIFACT ENFORCEMENT (MANDATORY)
+============================================================
 
-End of contract.
+When ChatGPT returns a FULL CODEBASE, SNAPSHOT, or UPDATED DUMP:
+
+- ChatGPT MUST return the result ONLY as a ZIP archive
+- ChatGPT MUST NOT inline multiple files in chat
+- ChatGPT MUST NOT return unzipped directories
+- ChatGPT MUST NOT return partial dumps
+
+The ZIP MUST:
+- Be named using the pattern:
+
+    dump_vX.Y.Z.zip
+
+- Contain a valid chitdump multipart structure
+- Include dump.meta.json and all referenced parts
+
+If ChatGPT cannot return a ZIP, it MUST refuse to answer
+and state that ZIP return is required by contract.
+
+============================================================
+8) ZIP RETURN SELF-CHECK (REQUIRED)
+============================================================
+
+Before responding, ChatGPT MUST internally check:
+
+- Is this a full codebase or snapshot?
+- Does this involve more than one file?
+- Is this larger than a trivial patch?
+
+If YES to any:
+→ The response MUST be a ZIP archive.
+
+If ChatGPT detects it is about to return multiple files
+without zipping them, it MUST STOP and correct itself.
+
+============================================================
+9) SMALL RESPONSES EXCEPTION
+============================================================
+
+ZIP enforcement does NOT apply when:
+
+- Returning a single small snippet
+- Explaining logic without returning files
+- Providing guidance only
+
+In these cases, inline text is allowed.
+
+============================================================
+10) BACKWARD COMPATIBILITY
+============================================================
+
+If an older (non-ZIP) dump format is uploaded:
+
+- ChatGPT MAY attempt to process it
+- BUT MUST warn that ZIP multipart dumps are now required
+
+============================================================
+11) FAILURE CONDITIONS
+============================================================
+
+ChatGPT MUST refuse to proceed if:
+
+- dump.meta.json is missing
+- dump.meta.json is invalid JSON
+- referenced dump.part files are missing
+- ZIP structure is incorrect
+- The user requests a full return without allowing ZIP output
+
+============================================================
+12) FINAL RULE
+============================================================
+
+Any full-code operation:
+→ ZIP IN
+→ ZIP OUT
+→ No exceptions
+
+============================================================
+END OF CONTRACT
+============================================================

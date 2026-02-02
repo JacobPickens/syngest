@@ -6,7 +6,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dump:generate": "node ./version-control/generate-dump.js",
+    "dump:generate": "node ./version-control/dump-generate.js",
     "dump:apply": "node ./version-control/dump-apply.js",
     "dump:active": "node ./version-control/print-active.js",
     "dump:undo": "node ./version-control/dump-undo.js"
