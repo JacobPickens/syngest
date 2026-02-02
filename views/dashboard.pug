@@ -1,62 +1,62 @@
 extends layout
-  block content
-    .wrap
-      header.header
-        .title
-          span.dot
-          .tcopy
-            .tmain SCAN DASH // LIVE VIEW
-            .subtitle
-              span#hdrLastBlock Last block: —
-              br
-              span#hdrLastTime Last scan: —
-              br
-              span#hdrFirstEver First scrape: —
+block content
+  .wrap
+    header.header
+      .title
+        span.dot
+        .tcopy
+          .tmain SCAN DASH // LIVE VIEW
+          .subtitle
+            span#hdrLastBlock Last block: —
+            br
+            span#hdrLastTime Last scan: —
+            br
+            span#hdrFirstEver First scrape: —
 
-        .pills
-          .pill
-            span.label UNIQUE
-            span.value#pUnique 0
-          .pill
-            span.label OBS
-            span.value#pObs 0
-          .pill
-            span.label HOT
-            span.value#pHot 0
+      .pills
+        .pill
+          span.label UNIQUE
+          span.value#pUnique 0
+        .pill
+          span.label OBS
+          span.value#pObs 0
+        .pill
+          span.label HOT
+          span.value#pHot 0
 
-      .grid
-        .panel.terminal
-          .panelHeader
-            span.panelTitle TERMINAL
-            span.panelRight#termMeta —
-          pre.console#console
+    .grid
+      .panel.terminal
+        .panelHeader
+          span.panelTitle TERMINAL
+          span.panelRight#termMeta —
+        pre.console#console
 
-        .panel.sched
-          .schedHead
-            .hleft
-              | NEXT SCAN
-              span.mono#countdown(style="margin-left:10px") —
-            .tag#schedState —
-          .schedBody
-            .row
-              label(for="delayMin") delay_minutes
-              input#delayMin(type="number" min="1" step="1" value="15")
-            .row
-              button#armBtn Arm
-              button#cancelBtn.secondary Cancel
-              button#runNowBtn.ghost Run now
+      .panel.sched
+        .schedHead
+          .hleft
+            | NEXT SCAN
+            span.mono#countdown(style="margin-left:10px") —
+          .tag#schedState —
+        .schedBody
+          .row
+            label(for="delayMin") delay_minutes
+            input#delayMin(type="number" min="1" step="1" value="15")
+          .row
+            button#armBtn Arm
+            button#cancelBtn.secondary Cancel
+            button#runNowBtn.ghost Run now
 
-        .panel.results
-          .panelHeader
-            span.panelTitle RESULTS
-            span.panelRight#runMeta —
-          .tableWrap
-            table.table
-              thead
-                tr
-                  th IP
-                  th LAST SEEN
-                  th SEEN
-              tbody#rowsBody
-                tr
-                  td(colspan="3").muted waiting…
+      .panel.results
+        .panelHeader
+          span.panelTitle RESULTS
+          span.panelRight#runMeta —
+        .tableWrap
+          table.table
+            thead
+              tr
+                th IP
+                th LAST SEEN
+                th SEEN
+            tbody#rowsBody
+              tr
+                td(colspan="3").muted waiting…
