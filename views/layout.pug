@@ -1,0 +1,16 @@
+doctype html
+html(lang="en")
+  head
+    meta(charset="utf-8")
+    meta(name="viewport", content="width=device-width, initial-scale=1")
+    title #{title}
+    link(rel="stylesheet", href="/public/css/terminal.css")
+  body(class="scanlines")
+    //- scanlines MUST be its own layer (so it doesn't collide with body:before grid)
+    div.scanlinesOverlay(aria-hidden="true")
+    //- three laser grid layers (A/B via body pseudos, C via this div)
+    div.laser3(aria-hidden="true")
+    //- rare “connection loss fuzz” overlay (toggled by JS)
+    div.fuzzOverlay(aria-hidden="true")
+    block content
+    script(src="/public/js/dashboard.js" defer)

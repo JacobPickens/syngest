@@ -1,0 +1,33 @@
+{
+  "running": false,
+  "meta": {
+    "endedAtMs": 1770028062495,
+    "result": {
+      "code": 1,
+      "signal": null
+    }
+  },
+  "stats": {},
+  "lines": [
+    "FATAL: Error: PRODUCER_CMD is empty. Set PRODUCER_CMD in config.",
+    "    at main (/www/control/safe_scan.js:173:11)",
+    "    at Object.<anonymous> (/www/control/safe_scan.js:342:3)",
+    "    at Module._compile (node:internal/modules/cjs/loader:1521:14)",
+    "    at Module._extensions..js (node:internal/modules/cjs/loader:1623:10)",
+    "    at Module.load (node:internal/modules/cjs/loader:1266:32)",
+    "    at Module._load (node:internal/modules/cjs/loader:1091:12)",
+    "    at Function.executeUserEntryPoint [as runMain] (node:internal/modules/run_main:164:12)",
+    "    at node:internal/main/run_main_module:28:49",
+    "Error: PRODUCER_CMD is empty. Set PRODUCER_CMD in config.",
+    "    at main (/www/control/safe_scan.js:173:11)",
+    "    at Object.<anonymous> (/www/control/safe_scan.js:342:3)",
+    "    at Module._compile (node:internal/modules/cjs/loader:1521:14)",
+    "    at Module._extensions..js (node:internal/modules/cjs/loader:1623:10)",
+    "    at Module.load (node:internal/modules/cjs/loader:1266:32)",
+    "    at Module._load (node:internal/modules/cjs/loader:1091:12)",
+    "    at Function.executeUserEntryPoint [as runMain] (node:internal/modules/run_main:164:12)",
+    "    at node:internal/main/run_main_module:28:49",
+    "[dashboard] scan ended: code=1 signal=null"
+  ],
+  "updatedAtMs": 1770028062495
+}
