@@ -5,7 +5,8 @@
   "description": "Non-interfering Express + Pug scan dashboard that polls SQLite and a log file.",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "apply:diff": "node scripts/apply-latest-diff.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
