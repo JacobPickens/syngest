@@ -1,12 +1,5 @@
-// --- views/dashboard.pug ---
-doctype html
-html
-  head
-    meta(charset="utf-8")
-    meta(name="viewport" content="width=device-width, initial-scale=1")
-    title Scan Dashboard
-    link(rel="stylesheet" href="/css/terminal.css")
-  body
+extends layout
+  block content
     .wrap
       header.header
         .title
@@ -67,4 +60,3 @@ html
               tbody#rowsBody
                 tr
                   td(colspan="3").muted waiting…
-  script(src="/js/dashboard.js")
