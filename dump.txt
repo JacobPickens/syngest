@@ -1,0 +1,4427 @@
+---.env---
+SCAN_N_BLOCKS=100
+DB_PATH=online.sqlite
+OUTPUT_PATH=runOutput.txt
+SCAN_CMD=node safe_scan.js
+SCAN_N_BLOCKS=100
+
+
+---iterateBlocks.js---
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+
+/**
+ * iterateBlocks(db, filePath, opts)
+ *
+ * Randomly iterates over lines in filePath WITHOUT repeats until exhausted,
+ * then starts a new cycle. State is persisted in SQLite.
+ *
+ * Adds per-run tagging: each selected line is recorded in line_picker_picks
+ * with run_id + namespace + file_id + line_index + line_text + picked_at.
+ *
+ * Uses a line-offset index for speed and low memory usage.
+ *
+ * opts:
+ * - namespace: string (default: basename(filePath))
+ * - ignoreBlank: boolean (default true)
+ * - maxLineBytes: integer (default 8192)
+ * - runId: string (optional, recommended) run identifier used for tagging
+ *          If omitted, a run id is auto-generated and exposed via api.runId.
+ *
+ * Returned object:
+ * - runId: string
+ * - next(): Promise<string>
+ * - nextN(n): Promise<string[]>
+ * - nextMeta(): Promise<{text,lineIndex,startByte,endByte}>
+ * - nextMetaN(n): Promise<Array<{text,lineIndex,startByte,endByte}>>
+ * - info(): Promise<object>
+ */
+
+async function iterateBlocks(db, filePath, opts = {}) {
+  const absFile = path.resolve(filePath);
+  const namespace = opts.namespace || path.basename(absFile);
+  const ignoreBlank = opts.ignoreBlank !== false;
+  const maxLineBytes = Number.isInteger(opts.maxLineBytes) ? opts.maxLineBytes : 8192;
+
+  // Per-run tag (stable identifier you pass from your main script)
+  const runId = String(opts.runId || makeRunId());
+
+  await ensureTables(db);
+
+  // Build line-offset index
+  const { meta, index } = buildLineIndex(absFile, { ignoreBlank });
+
+  if (index.count === 0) {
+    throw new Error(`File contains no usable lines: ${absFile}`);
+  }
+
+  const fileId = await upsertFile(db, meta);
+
+  // Ensure state row exists
+  await ensureStateRow(db, namespace, fileId, index.count);
+
+  async function next() {
+    const arr = await nextN(1);
+    return arr[0];
+  }
+
+  async function nextN(n) {
+    const metas = await nextMetaN(n);
+    return metas.map((m) => m.text);
+  }
+
+  async function nextMeta() {
+    const arr = await nextMetaN(1);
+    return arr[0];
+  }
+
+  async function nextMetaN(n) {
+    if (!Number.isInteger(n) || n <= 0) {
+      throw new Error('nextMetaN(n): n must be a positive integer');
+    }
+
+    // Transaction ensures: (1) state mutation is consistent, (2) picks logging matches the state update.
+    await exec(db, 'BEGIN IMMEDIATE;');
+    try {
+      let state = await getState(db, namespace, fileId);
+      let remaining = safeParseJsonArray(state?.remaining_json);
+
+      // Reset if exhausted or mismatch
+      if (!remaining || remaining.length === 0 || state.total !== index.count) {
+        remaining = freshRemaining(index.count);
+        // New cycle marker
+        await setCycle(db, namespace, fileId, Date.now(), index.count, remaining);
+      }
+
+      const take = Math.min(n, remaining.length);
+      const pickedIdx = new Array(take);
+
+      // Random pick without replacement (swap-pop)
+      for (let i = 0; i < take; i++) {
+        const r = crypto.randomInt(0, remaining.length);
+        pickedIdx[i] = remaining[r];
+        const last = remaining.pop();
+        if (r < remaining.length) remaining[r] = last;
+      }
+
+      // Persist remaining for this cycle
+      await writeRemaining(db, namespace, fileId, index.count, remaining);
+
+      // Read selected lines by offset (outside DB but inside txn is fine; small reads)
+      const pickedMeta = pickedIdx.map((li) => {
+        const startByte = index.starts[li];
+        const endByte = index.ends[li];
+        const text = readLineSlice(absFile, startByte, endByte, maxLineBytes);
+        return { text, lineIndex: li, startByte, endByte };
+      });
+
+      // Per-run tagging: log picks
+      const ts = nowSec();
+      for (let i = 0; i < take; i++) {
+        await logPick(db, {
+          runId,
+          namespace,
+          fileId,
+          lineIndex: pickedMeta[i].lineIndex,
+          lineText: pickedMeta[i].text,
+          pickedAt: ts,
+        });
+      }
+
+      await exec(db, 'COMMIT;');
+      return pickedMeta;
+    } catch (e) {
+      await exec(db, 'ROLLBACK;').catch(() => {});
+      throw e;
+    }
+  }
+
+  async function info() {
+    const state = await getState(db, namespace, fileId);
+    const remaining = safeParseJsonArray(state?.remaining_json) || [];
+    return {
+      runId,
+      namespace,
+      file: absFile,
+      total_lines: index.count,
+      remaining_in_cycle: remaining.length,
+      cycle: state?.cycle ?? null,
+      last_updated_at: state?.updated_at ?? null,
+    };
+  }
+
+  return { runId, next, nextN, nextMeta, nextMetaN, info };
+}
+
+/* ============================================================================
+   LINE OFFSET INDEX
+   ============================================================================ */
+
+function buildLineIndex(filePath, { ignoreBlank }) {
+  const st = fs.statSync(filePath);
+  const fd = fs.openSync(filePath, 'r');
+
+  try {
+    const CHUNK = 1 << 16; // 64KB
+    const buf = Buffer.allocUnsafe(CHUNK);
+
+    const starts = [];
+    const ends = [];
+
+    let filePos = 0;
+    let lineStart = 0;
+    let hasNonWs = false;
+    let lastCR = false;
+
+    function isWs(b) {
+      // space, tab, CR
+      return b === 0x20 || b === 0x09 || b === 0x0d;
+    }
+
+    while (true) {
+      const n = fs.readSync(fd, buf, 0, CHUNK, filePos);
+      if (n <= 0) break;
+
+      for (let i = 0; i < n; i++) {
+        const b = buf[i];
+
+        if (ignoreBlank && b !== 0x0a && !isWs(b)) hasNonWs = true;
+
+        if (b === 0x0a) { // '\n'
+          const end = (filePos + i) - (lastCR ? 1 : 0);
+          if (!ignoreBlank || hasNonWs) {
+            starts.push(lineStart);
+            ends.push(end);
+          }
+          lineStart = filePos + i + 1;
+          hasNonWs = false;
+          lastCR = false;
+        } else {
+          lastCR = b === 0x0d;
+        }
+      }
+
+      filePos += n;
+    }
+
+    // last line if no trailing newline
+    if (lineStart < st.size) {
+      if (!ignoreBlank || hasNonWs) {
+        starts.push(lineStart);
+        ends.push(st.size);
+      }
+    }
+
+    return {
+      meta: {
+        path: filePath,
+        mtimeMs: Math.floor(st.mtimeMs),
+        sizeBytes: st.size,
+        lineCount: starts.length,
+      },
+      index: {
+        starts,
+        ends,
+        count: starts.length,
+      },
+    };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function readLineSlice(filePath, start, end, maxBytes) {
+  const rawLen = end - start;
+  if (rawLen < 0) throw new Error('Invalid line slice');
+
+  const len = Math.min(rawLen, maxBytes);
+  const fd = fs.openSync(filePath, 'r');
+  try {
+    const buf = Buffer.allocUnsafe(len);
+    const n = fs.readSync(fd, buf, 0, len, start);
+    let s = buf.slice(0, n).toString('utf8').trim();
+    if (rawLen > maxBytes) s += '…';
+    return s;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/* ============================================================================
+   SQLITE STATE + PER-RUN PICK LOGGING
+   ============================================================================ */
+
+async function ensureTables(db) {
+  await exec(db, `
+    CREATE TABLE IF NOT EXISTS line_picker_files (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      path TEXT UNIQUE,
+      mtime_ms INTEGER,
+      size_bytes INTEGER,
+      line_count INTEGER,
+      updated_at INTEGER
+    );
+  `);
+
+  await exec(db, `
+    CREATE TABLE IF NOT EXISTS line_picker_state (
+      namespace TEXT,
+      file_id INTEGER,
+      cycle INTEGER,
+      total INTEGER,
+      remaining_json TEXT,
+      updated_at INTEGER,
+      PRIMARY KEY (namespace, file_id)
+    );
+  `);
+
+  await exec(db, `
+    CREATE TABLE IF NOT EXISTS line_picker_picks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_id TEXT NOT NULL,
+      namespace TEXT NOT NULL,
+      file_id INTEGER NOT NULL,
+      line_index INTEGER NOT NULL,
+      line_text TEXT NOT NULL,
+      picked_at INTEGER NOT NULL
+    );
+  `);
+
+  await exec(db, `CREATE INDEX IF NOT EXISTS idx_line_picker_picks_run ON line_picker_picks(run_id);`);
+  await exec(db, `CREATE INDEX IF NOT EXISTS idx_line_picker_picks_ns ON line_picker_picks(namespace, file_id);`);
+  await exec(db, `CREATE INDEX IF NOT EXISTS idx_line_picker_picks_time ON line_picker_picks(picked_at);`);
+}
+
+async function upsertFile(db, meta) {
+  await exec(db, `
+    INSERT INTO line_picker_files(path, mtime_ms, size_bytes, line_count, updated_at)
+    VALUES(?,?,?,?,?)
+    ON CONFLICT(path) DO UPDATE SET
+      mtime_ms=excluded.mtime_ms,
+      size_bytes=excluded.size_bytes,
+      line_count=excluded.line_count,
+      updated_at=excluded.updated_at;
+  `, [meta.path, meta.mtimeMs, meta.sizeBytes, meta.lineCount, nowSec()]);
+
+  const row = await get(db, `SELECT id FROM line_picker_files WHERE path=?`, [meta.path]);
+  return row.id;
+}
+
+async function ensureStateRow(db, namespace, fileId, total) {
+  const exists = await get(db, `
+    SELECT 1 FROM line_picker_state WHERE namespace=? AND file_id=?
+  `, [namespace, fileId]);
+
+  if (exists) return;
+
+  const remaining = freshRemaining(total);
+  await exec(db, `
+    INSERT INTO line_picker_state(namespace, file_id, cycle, total, remaining_json, updated_at)
+    VALUES(?,?,?,?,?,?)
+  `, [namespace, fileId, Date.now(), total, JSON.stringify(remaining), nowSec()]);
+}
+
+async function getState(db, namespace, fileId) {
+  return get(db, `
+    SELECT cycle, total, remaining_json, updated_at
+    FROM line_picker_state
+    WHERE namespace=? AND file_id=?
+  `, [namespace, fileId]);
+}
+
+async function setCycle(db, namespace, fileId, cycleMs, total, remaining) {
+  await exec(db, `
+    UPDATE line_picker_state
+    SET cycle=?, total=?, remaining_json=?, updated_at=?
+    WHERE namespace=? AND file_id=?
+  `, [cycleMs, total, JSON.stringify(remaining), nowSec(), namespace, fileId]);
+}
+
+async function writeRemaining(db, namespace, fileId, total, remaining) {
+  await exec(db, `
+    UPDATE line_picker_state
+    SET total=?, remaining_json=?, updated_at=?
+    WHERE namespace=? AND file_id=?
+  `, [total, JSON.stringify(remaining), nowSec(), namespace, fileId]);
+}
+
+async function logPick(db, { runId, namespace, fileId, lineIndex, lineText, pickedAt }) {
+  await exec(db, `
+    INSERT INTO line_picker_picks(run_id, namespace, file_id, line_index, line_text, picked_at)
+    VALUES(?,?,?,?,?,?)
+  `, [runId, namespace, fileId, lineIndex, lineText, pickedAt]);
+}
+
+/* ============================================================================
+   HELPERS
+   ============================================================================ */
+
+function freshRemaining(total) {
+  const arr = Array.from({ length: total }, (_, i) => i);
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = crypto.randomInt(0, i + 1);
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+function safeParseJsonArray(s) {
+  try {
+    const v = JSON.parse(s);
+    return Array.isArray(v) ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+function nowSec() {
+  return Math.floor(Date.now() / 1000);
+}
+
+function makeRunId() {
+  // run_YYYYMMDD_HHMMSS_rand
+  const d = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  const stamp =
+    `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}_` +
+    `${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+  const rand = crypto.randomBytes(3).toString('hex');
+  return `run_${stamp}_${rand}`;
+}
+
+/* ============================================================================
+
+   sqlite3 promise wrappers
+
+   ============================================================================ */
+
+function exec(db, sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.run(sql, params, function (err) {
+      if (err) reject(err);
+      else resolve(this);
+    });
+  });
+}
+
+function get(db, sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.get(sql, params, function (err, row) {
+      if (err) reject(err);
+      else resolve(row);
+    });
+  });
+}
+
+module.exports = { iterateBlocks };
+
+
+---public/css/terminal.css---
+/* --- public/css/terminal.css --- */
+/*
+  SYNGEST Dashboard Skin
+  - Semantic variables driven by body state classes:
+      .state-idle | .state-grazing | .state-ingesting
+  - Orange = metabolic activity (trace in grazing, dominant in ingesting)
+*/
+
+/* ======================================================
+   CORE COLOR SYSTEM (authoritative palette)
+   ====================================================== */
+
+/* ---------- IDLE STATE (Dormant) ---------- */
+:root {
+  --idle-bg-primary: #070B10;
+  --idle-bg-panel:   #0B1220;
+  --idle-bg-raised:  #111A2B;
+
+  --idle-border:     #1E2A3A;
+  --idle-ui-muted:   #2A3A4F;
+
+  --idle-text-primary:   #E6EDF3;
+  --idle-text-secondary: #9FB0C2;
+  --idle-text-disabled:  #6F8196;
+
+  --idle-glow: #1A2636;
+
+  /* ---------- GRAZING STATE (Discovery) ---------- */
+  --grazing-bg-primary: #071015;
+  --grazing-bg-panel:   #0B1C22;
+  --grazing-bg-raised:  #0F2730;
+
+  --grazing-accent-teal:        #19C2A0;
+  --grazing-accent-teal-bright: #22D3B6;
+  --grazing-accent-blue:        #2BA6F7;
+
+  --grazing-border: #1F6F8B;
+  --grazing-divider:#145A6A;
+
+  --grazing-energy-core: #FF9F1C;
+  --grazing-energy-soft: #FFB703;
+
+  --grazing-text-primary:   #E8FDF8;
+  --grazing-text-secondary: #A3E5D8;
+  --grazing-text-muted:     #6FBFB2;
+
+  /* ---------- INGESTING STATE (Active / Synthesis) ---------- */
+  --ingest-bg-primary: #120B07;
+  --ingest-bg-panel:   #1A120B;
+  --ingest-bg-raised:  #24170E;
+
+  --ingest-accent-primary: #FF8C1A;
+  --ingest-accent-bright:  #FFA630;
+  --ingest-accent-core:    #FFB703;
+
+  --ingest-structure-teal: #1FA4A9;
+  --ingest-structure-dark: #1E7F8C;
+
+  --ingest-glow-active: #FF6A00;
+  --ingest-glow-peak:   #FF4500;
+
+  --ingest-text-primary:   #FFF1E6;
+  --ingest-text-secondary: #FFD8B0;
+  --ingest-text-muted:     #CFA77A;
+
+  /* Typography */
+  --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono","Courier New", monospace;
+  --sans: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";
+}
+
+/* ======================================================
+   STATE → SEMANTIC TOKENS
+   ====================================================== */
+
+body {
+  /* defaults (grazing) */
+  --bg-primary: var(--grazing-bg-primary);
+  --bg-panel:   var(--grazing-bg-panel);
+  --bg-raised:  var(--grazing-bg-raised);
+
+  --border:     color-mix(in srgb, var(--grazing-border) 55%, transparent);
+  --divider:    color-mix(in srgb, var(--grazing-divider) 55%, transparent);
+
+  --text:       var(--grazing-text-primary);
+  --text2:      var(--grazing-text-secondary);
+  --muted:      var(--grazing-text-muted);
+
+  --accent-a:   var(--grazing-accent-teal);
+  --accent-b:   var(--grazing-accent-blue);
+
+  /* “energy” is orange; in grazing it must be trace */
+  --energy:     var(--grazing-energy-core);
+  --energy2:    var(--grazing-energy-soft);
+
+  --shadow: 0 10px 26px rgba(0, 0, 0, .45);
+  --glass: rgba(10, 26, 32, .60);
+  --glass2: rgba(12, 34, 42, .42);
+  --blur: 10px;
+}
+
+body.state-idle {
+  --bg-primary: var(--idle-bg-primary);
+  --bg-panel:   var(--idle-bg-panel);
+  --bg-raised:  var(--idle-bg-raised);
+
+  --border:     color-mix(in srgb, var(--idle-border) 75%, transparent);
+  --divider:    color-mix(in srgb, var(--idle-ui-muted) 55%, transparent);
+
+  --text:       var(--idle-text-primary);
+  --text2:      var(--idle-text-secondary);
+  --muted:      var(--idle-text-disabled);
+
+  --accent-a:   color-mix(in srgb, var(--idle-text-secondary) 70%, #2BA6F7 30%);
+  --accent-b:   color-mix(in srgb, var(--idle-text-secondary) 70%, #19C2A0 30%);
+
+  --energy:     #7a8796; /* no orange in idle */
+  --energy2:    #7a8796;
+
+  --glass: rgba(11, 18, 32, .70);
+  --glass2: rgba(17, 26, 43, .46);
+  --blur: 8px;
+}
+
+body.state-ingesting {
+  --bg-primary: var(--ingest-bg-primary);
+  --bg-panel:   var(--ingest-bg-panel);
+  --bg-raised:  var(--ingest-bg-raised);
+
+  --border:     color-mix(in srgb, var(--ingest-structure-dark) 55%, transparent);
+  --divider:    color-mix(in srgb, var(--ingest-structure-teal) 50%, transparent);
+
+  --text:       var(--ingest-text-primary);
+  --text2:      var(--ingest-text-secondary);
+  --muted:      var(--ingest-text-muted);
+
+  /* keep teal/blue as structural contrast */
+  --accent-a:   var(--ingest-structure-teal);
+  --accent-b:   var(--ingest-structure-dark);
+
+  /* orange-forward */
+  --energy:     var(--ingest-accent-primary);
+  --energy2:    var(--ingest-accent-core);
+
+  --glass: rgba(26, 18, 11, .72);
+  --glass2: rgba(36, 23, 14, .44);
+  --blur: 10px;
+}
+
+/* ======================================================
+   BASE
+   ====================================================== */
+
+* { box-sizing: border-box; }
+
+html, body { height: 100%; }
+
+body {
+  margin: 0;
+  font-family: var(--sans);
+  color: var(--text);
+  background:
+    radial-gradient(1200px 720px at 18% -10%, color-mix(in srgb, var(--accent-a) 20%, transparent) , transparent 56%),
+    radial-gradient(900px 600px at 105% 0%, color-mix(in srgb, var(--accent-b) 18%, transparent), transparent 58%),
+    radial-gradient(1100px 700px at 40% 120%, color-mix(in srgb, var(--energy) 10%, transparent), transparent 60%),
+    linear-gradient(180deg, color-mix(in srgb, var(--bg-primary) 88%, #000 12%), var(--bg-primary));
+  overflow-x: hidden;
+}
+
+.mono { font-family: var(--mono); }
+.sep { opacity: .55; margin: 0 .35rem; }
+.muted { color: var(--muted); }
+
+/* Prevent initial pulse/flash animations until JS is live */
+body.noPulse * { scroll-behavior: auto; }
+
+/* ======================================================
+   SUBTLE OVERLAYS (scanlines + grid)
+   ====================================================== */
+
+.scanlinesOverlay {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background:
+    linear-gradient(to bottom,
+      rgba(255,255,255,.06),
+      rgba(255,255,255,0) 2px,
+      rgba(255,255,255,0) 6px);
+  background-size: 100% 8px;
+  opacity: .07;
+  mix-blend-mode: overlay;
+  z-index: 1;
+}
+
+.laser3 {
+  position: fixed;
+  inset: -12%;
+  pointer-events: none;
+  opacity: .16;
+  z-index: 0;
+  background:
+    repeating-linear-gradient(90deg,
+      rgba(255,255,255,0) 0 22px,
+      color-mix(in srgb, var(--accent-b) 18%, transparent) 22px 23px,
+      rgba(255,255,255,0) 23px 44px),
+    repeating-linear-gradient(0deg,
+      rgba(255,255,255,0) 0 22px,
+      color-mix(in srgb, var(--accent-a) 14%, transparent) 22px 23px,
+      rgba(255,255,255,0) 23px 44px);
+  transform: rotate(6deg);
+  filter: blur(.2px);
+}
+
+.fuzzOverlay {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0;
+  z-index: 2;
+  background:
+    radial-gradient(900px 600px at 50% 50%, rgba(255,255,255,.08), transparent 60%),
+    repeating-linear-gradient(90deg, rgba(255,255,255,.06) 0 1px, rgba(255,255,255,0) 1px 6px);
+  mix-blend-mode: overlay;
+}
+
+body.fuzzOn .fuzzOverlay { opacity: .45; }
+
+/* ======================================================
+   LAYOUT
+   ====================================================== */
+
+.dash {
+  position: relative;
+  z-index: 3;
+  padding: 18px 18px 26px;
+  max-width: 1400px;
+  margin: 0 auto;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  background: linear-gradient(180deg, var(--glass), var(--glass2));
+  backdrop-filter: blur(var(--blur));
+  border-radius: 14px;
+  box-shadow: var(--shadow);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 240px;
+}
+
+.mark {
+  width: 22px;
+  height: 22px;
+  border-radius: 8px;
+  background:
+    radial-gradient(10px 10px at 30% 30%, rgba(255,255,255,.55), transparent 60%),
+    linear-gradient(135deg, color-mix(in srgb, var(--accent-a) 70%, #000 30%), color-mix(in srgb, var(--accent-b) 70%, #000 30%));
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--accent-a) 55%, transparent),
+    0 0 18px color-mix(in srgb, var(--accent-a) 22%, transparent);
+}
+
+.word {
+  font-weight: 800;
+  letter-spacing: .16em;
+  font-size: 14px;
+  opacity: .95;
+}
+
+.stateTag {
+  margin-left: 8px;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--accent-a) 50%, transparent);
+  background: rgba(0,0,0,.18);
+  color: var(--text2);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.stateTag .dots {
+  opacity: .7;
+  letter-spacing: 2px;
+}
+
+.topMeta {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 10px 14px;
+  align-items: center;
+}
+
+.facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 14px;
+}
+
+.fact {
+  display: grid;
+  grid-template-columns: auto auto;
+  gap: 6px;
+  align-items: baseline;
+  padding: 6px 10px;
+  border-radius: 12px;
+  border: 1px solid var(--divider);
+  background: rgba(0,0,0,.16);
+}
+
+.fact .k { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }
+.fact .v { font-family: var(--mono); font-size: 12px; color: var(--text2); }
+
+.toggle {
+  justify-self: end;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px;
+  border: 1px solid var(--divider);
+  border-radius: 999px;
+  background: rgba(0,0,0,.18);
+}
+
+.stateBtn {
+  appearance: none;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 12px;
+  letter-spacing: .06em;
+  padding: 7px 10px;
+  border-radius: 999px;
+  cursor: pointer;
+}
+
+.stateBtn.active {
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--accent-a) 55%, transparent);
+  background: color-mix(in srgb, var(--accent-a) 18%, transparent);
+  box-shadow: 0 0 18px color-mix(in srgb, var(--accent-a) 18%, transparent);
+}
+
+.tagRow {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: baseline;
+  color: var(--muted);
+  font-size: 12px;
+}
+.tagRow .tag { opacity: .85; text-transform: uppercase; letter-spacing: .08em; }
+.tagRow .mono { color: var(--text2); }
+
+.pills {
+  margin-top: 14px;
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.pill {
+  position: relative;
+  padding: 12px 12px;
+  border-radius: 14px;
+  border: 1px solid var(--border);
+  background: linear-gradient(180deg, rgba(0,0,0,.22), rgba(0,0,0,.12));
+  box-shadow: 0 10px 22px rgba(0,0,0,.35);
+  overflow: hidden;
+}
+
+.pill:before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(120px 80px at 20% 0%, color-mix(in srgb, var(--accent-a) 18%, transparent), transparent 65%),
+    radial-gradient(120px 80px at 80% 0%, color-mix(in srgb, var(--accent-b) 16%, transparent), transparent 65%);
+  opacity: .9;
+  pointer-events: none;
+}
+
+.pill .label {
+  position: relative;
+  display: block;
+  font-size: 11px;
+  letter-spacing: .10em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+
+.pill .value {
+  position: relative;
+  display: block;
+  font-family: var(--mono);
+  font-size: 20px;
+  color: var(--text);
+}
+
+.pillPulse {
+  animation: pillPulse 550ms ease-out;
+}
+
+@keyframes pillPulse {
+  0%   { box-shadow: 0 0 0 rgba(0,0,0,0); transform: translateY(0); }
+  45%  { box-shadow: 0 0 24px color-mix(in srgb, var(--accent-a) 22%, transparent); transform: translateY(-1px); }
+  100% { box-shadow: 0 0 0 rgba(0,0,0,0); transform: translateY(0); }
+}
+
+.grid {
+  margin-top: 14px;
+  display: grid;
+  grid-template-columns: 64px 1fr;
+  gap: 14px;
+  align-items: start;
+}
+
+.rail {
+  position: sticky;
+  top: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px 8px;
+  border-radius: 16px;
+  border: 1px solid var(--border);
+  background: linear-gradient(180deg, var(--glass), rgba(0,0,0,.18));
+  backdrop-filter: blur(var(--blur));
+  box-shadow: var(--shadow);
+}
+
+.railBtn {
+  border: 1px solid var(--divider);
+  background: rgba(0,0,0,.18);
+  color: var(--text2);
+  border-radius: 14px;
+  padding: 10px 0;
+  cursor: pointer;
+}
+
+.railBtn:hover {
+  border-color: color-mix(in srgb, var(--accent-a) 55%, transparent);
+}
+
+.railBtn .ico {
+  display: block;
+  font-family: var(--mono);
+  font-size: 16px;
+  opacity: .9;
+}
+
+.railSep {
+  height: 1px;
+  background: var(--divider);
+  margin: 4px 6px;
+  opacity: .9;
+}
+
+.col { display: grid; gap: 14px; }
+
+.row {
+  display: grid;
+  grid-template-columns: 1.3fr .9fr;
+  gap: 14px;
+}
+
+.panel {
+  border-radius: 16px;
+  border: 1px solid var(--border);
+  background: linear-gradient(180deg, var(--glass), rgba(0,0,0,.16));
+  backdrop-filter: blur(var(--blur));
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+.panelHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--divider);
+  background: rgba(0,0,0,.12);
+}
+
+.panelHead .h {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.panelHead .title {
+  font-weight: 750;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  font-size: 12px;
+  color: var(--text);
+}
+
+.panelHead .sub {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.panelHead .right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--divider);
+  background: rgba(0,0,0,.16);
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text2);
+}
+
+.panelBody { padding: 14px; }
+
+.feedTop {
+  display: flex;
+  justify-content: space-between;
+  align-items: end;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.feedVal .big {
+  font-family: var(--mono);
+  font-size: 34px;
+  letter-spacing: .02em;
+}
+
+.feedVal .unit {
+  margin-left: 8px;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.miniMeta {
+  display: grid;
+  gap: 6px;
+  text-align: right;
+}
+.miniMeta .k {
+  font-size: 11px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-right: 6px;
+}
+.miniMeta .v { color: var(--text2); }
+
+#feedChart {
+  width: 100%;
+  height: auto;
+  display: block;
+  border-radius: 12px;
+  border: 1px solid var(--divider);
+  background: rgba(0,0,0,.18);
+}
+
+.btnEnergy {
+  border: 1px solid color-mix(in srgb, var(--energy) 55%, transparent);
+  background: linear-gradient(180deg,
+    color-mix(in srgb, var(--energy) 32%, transparent),
+    rgba(0,0,0,.18));
+  color: var(--text);
+  border-radius: 12px;
+  padding: 8px 12px;
+  font-family: var(--mono);
+  cursor: pointer;
+  letter-spacing: .06em;
+}
+
+body.state-grazing .btnEnergy {
+  /* trace orange only */
+  box-shadow: 0 0 16px color-mix(in srgb, var(--energy) 18%, transparent);
+}
+
+.blocksList {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 10px;
+}
+
+.blocksList li {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid var(--divider);
+  background: rgba(0,0,0,.14);
+}
+
+.blocksList .b { font-family: var(--mono); color: var(--text2); }
+.blocksList .t { font-family: var(--mono); color: var(--muted); font-size: 12px; }
+
+/* Hits table */
+.tableWrap {
+  overflow: auto;
+  border-radius: 12px;
+  border: 1px solid var(--divider);
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  min-width: 860px;
+}
+
+.table thead th {
+  position: sticky;
+  top: 0;
+  text-align: left;
+  font-size: 11px;
+  letter-spacing: .10em;
+  text-transform: uppercase;
+  font-family: var(--mono);
+  padding: 10px 12px;
+  color: var(--muted);
+  background: color-mix(in srgb, var(--bg-panel) 60%, rgba(0,0,0,.30));
+  border-bottom: 1px solid var(--divider);
+  z-index: 2;
+}
+
+.table tbody td {
+  padding: 10px 12px;
+  border-bottom: 1px solid color-mix(in srgb, var(--divider) 60%, transparent);
+  font-family: var(--mono);
+  color: var(--text2);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.table tbody tr:hover td {
+  background: color-mix(in srgb, var(--accent-a) 10%, transparent);
+}
+
+.ipRow.currentRun td { color: var(--text); }
+.ipRow.prevRun td { opacity: .88; }
+
+.ipRow.newIp {
+  transform: scale(1.2);
+  background: color-mix(in srgb, var(--accent-a) 14%, transparent);
+  outline: 1px solid color-mix(in srgb, var(--accent-a) 45%, transparent);
+  box-shadow: 0 0 20px color-mix(in srgb, var(--accent-a) 18%, transparent);
+}
+
+.ipRow.newIp.settle { transform: scale(1.0); transition: transform 600ms ease; }
+
+.stack { display: grid; gap: 14px; grid-template-rows: 1fr auto; }
+
+.console {
+  margin: 0;
+  height: 240px;
+  overflow: auto;
+  padding: 12px;
+  border-radius: 12px;
+  border: 1px solid var(--divider);
+  background: rgba(0,0,0,.18);
+  color: color-mix(in srgb, var(--text) 80%, var(--accent-a) 20%);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+
+/* Controls */
+.fieldRow {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.fieldRow label {
+  font-size: 12px;
+  color: var(--muted);
+  letter-spacing: .06em;
+}
+
+.fieldRow input {
+  width: 100%;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid var(--divider);
+  background: rgba(0,0,0,.18);
+  color: var(--text);
+  font-family: var(--mono);
+}
+
+.btnRow {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.btnRow button {
+  border-radius: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--divider);
+  background: rgba(0,0,0,.18);
+  color: var(--text2);
+  font-family: var(--mono);
+  cursor: pointer;
+}
+
+.btnRow button:hover { border-color: color-mix(in srgb, var(--accent-a) 55%, transparent); }
+
+button.btn-ok {
+  border-color: color-mix(in srgb, var(--accent-a) 55%, transparent);
+  background: color-mix(in srgb, var(--accent-a) 18%, rgba(0,0,0,.12));
+  color: var(--text);
+}
+
+button.btn-danger {
+  border-color: color-mix(in srgb, var(--energy) 40%, transparent);
+  background: color-mix(in srgb, var(--energy) 14%, rgba(0,0,0,.12));
+  color: var(--text);
+}
+
+button.btn-run {
+  border-color: color-mix(in srgb, var(--accent-b) 55%, transparent);
+  background: color-mix(in srgb, var(--accent-b) 18%, rgba(0,0,0,.12));
+  color: var(--text);
+}
+
+.nextRow, .note {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: baseline;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid var(--divider);
+  background: rgba(0,0,0,.14);
+  color: var(--muted);
+}
+
+.nextRow .k, .note .k { text-transform: uppercase; letter-spacing: .10em; font-size: 11px; }
+.nextRow .v, .note .v { color: var(--text2); font-family: var(--mono); }
+.note { margin-top: 12px; }
+
+.panel.controls.isRunning {
+  outline: 1px solid color-mix(in srgb, var(--energy) 55%, transparent);
+  box-shadow: 0 0 26px color-mix(in srgb, var(--energy) 18%, transparent);
+}
+
+/* Responsive */
+@media (max-width: 1080px) {
+  .pills { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .grid { grid-template-columns: 1fr; }
+  .rail { position: relative; flex-direction: row; justify-content: center; }
+  .row { grid-template-columns: 1fr; }
+  .table { min-width: 720px; }
+}
+
+---public/js/dashboard.js---
+/* --- public/js/dashboard.js --- */
+(() => {
+  'use strict';
+
+  const el = (id) => document.getElementById(id);
+  const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
+
+  const state = {
+    tailKey: 'global',
+    activeRun: null,
+    lastRowsSig: '',
+    feedSeries: [], // hot uniques over time (per minute-ish)
+    feedMaxPoints: 60
+  };
+
+  let scheduleState = null;
+  let firstEverAtSec = null;
+
+  /* -------------------- formatting -------------------- */
+
+  function fmtNum(n) {
+    if (n == null || Number.isNaN(Number(n))) return '—';
+    return Number(n).toLocaleString('en-US');
+  }
+
+  function fmtTs(sec) {
+    if (!sec || !Number.isFinite(Number(sec))) return '—';
+    const d = new Date(Number(sec) * 1000);
+    return d.toISOString().replace('T', ' ').replace('Z', 'Z');
+  }
+
+  function fmtMs(ms) {
+    if (ms == null || !Number.isFinite(Number(ms))) return '—';
+    const s = Math.max(0, Math.floor(Number(ms) / 1000));
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+    return String(m).padStart(2, '0') + ':' + String(r).padStart(2, '0');
+  }
+
+  /* -------------------- state toggle -------------------- */
+
+  const STATE_KEY = 'syngest_ui_state';
+
+  function setUiState(next) {
+    const body = document.body;
+
+    body.classList.remove('state-idle', 'state-grazing', 'state-ingesting');
+    body.classList.add(`state-${next}`);
+
+    // update toggle buttons
+    const btnMap = {
+      idle: el('stateIdleBtn'),
+      grazing: el('stateGrazingBtn'),
+      ingesting: el('stateIngestBtn')
+    };
+
+    for (const k of Object.keys(btnMap)) {
+      const b = btnMap[k];
+      if (!b) continue;
+      if (k === next) b.classList.add('active');
+      else b.classList.remove('active');
+    }
+
+    // label
+    const label = el('uiStateLabel');
+    if (label) {
+      label.textContent =
+        next === 'idle' ? 'IDLE' :
+        next === 'ingesting' ? 'INGESTING' :
+        'GRAZING';
+    }
+
+    try { localStorage.setItem(STATE_KEY, next); } catch {}
+  }
+
+  function initUiState() {
+    let v = null;
+    try { v = localStorage.getItem(STATE_KEY); } catch {}
+    if (v !== 'idle' && v !== 'grazing' && v !== 'ingesting') v = 'grazing';
+    setUiState(v);
+  }
+
+  /* -------------------- header + pills -------------------- */
+
+  function setHeaderFacts(meta, block, firstEverSec) {
+    if (firstEverSec && Number.isFinite(Number(firstEverSec))) {
+      if (firstEverAtSec == null) firstEverAtSec = Number(firstEverSec);
+      else firstEverAtSec = Math.min(firstEverAtSec, Number(firstEverSec));
+    }
+
+    const lastBlock = block && block.ip_block ? block.ip_block : '—';
+    const lastAt = meta && meta.created_at ? fmtTs(meta.created_at) : '—';
+    const firstEver = firstEverAtSec ? fmtTs(firstEverAtSec) : '—';
+
+    if (el('hLastBlock')) el('hLastBlock').textContent = lastBlock;
+    if (el('hLastTime')) el('hLastTime').textContent = lastAt;
+    if (el('hFirstEver')) el('hFirstEver').textContent = firstEver;
+  }
+
+  function setMeta(meta, block) {
+    if (!meta) {
+      if (el('activeRunTag')) el('activeRunTag').textContent = '—';
+      if (el('mRun')) el('mRun').textContent = '—';
+      if (el('mCreated')) el('mCreated').textContent = '—';
+      if (el('mPort')) el('mPort').textContent = '—';
+      if (el('mSource')) el('mSource').textContent = '—';
+      if (el('mBlock')) el('mBlock').textContent = '—';
+      return;
+    }
+
+    if (el('activeRunTag')) el('activeRunTag').textContent = meta.run_table || '—';
+    if (el('mRun')) el('mRun').textContent = meta.run_table || '—';
+    if (el('mCreated')) el('mCreated').textContent = fmtTs(meta.created_at);
+    if (el('mPort')) el('mPort').textContent = meta.port != null ? String(meta.port) : '—';
+    if (el('mSource')) el('mSource').textContent = meta.source || '—';
+    if (el('mBlock')) el('mBlock').textContent = (block && block.ip_block) ? block.ip_block : '—';
+  }
+
+  function pulse(id) {
+    const x = el(id);
+    if (!x) return;
+    x.classList.remove('pillPulse');
+    // force reflow
+    void x.offsetWidth;
+    x.classList.add('pillPulse');
+    setTimeout(() => x.classList.remove('pillPulse'), 550);
+  }
+
+  function applyDbStats(stats) {
+    if (!stats) return;
+
+    const prev = {
+      unique: el('pUnique')?.textContent,
+      total: el('pTotal')?.textContent,
+      hot: el('pHot')?.textContent,
+      first: el('pFirst')?.textContent,
+      last: el('pLast')?.textContent
+    };
+
+    const next = {
+      unique: fmtNum(stats.unique_ips),
+      total: fmtNum(stats.total_observations),
+      hot: fmtNum(stats.hot_unique_ips),
+      first: fmtTs(stats.first_seen),
+      last: fmtTs(stats.last_seen)
+    };
+
+    if (el('pUnique')) el('pUnique').textContent = next.unique;
+    if (el('pTotal')) el('pTotal').textContent = next.total;
+    if (el('pHot')) el('pHot').textContent = next.hot;
+    if (el('pFirst')) el('pFirst').textContent = next.first;
+    if (el('pLast')) el('pLast').textContent = next.last;
+
+    if (prev.unique !== next.unique) pulse('pillUnique');
+    if (prev.total !== next.total) pulse('pillTotal');
+    if (prev.hot !== next.hot) pulse('pillHot');
+    if (prev.first !== next.first) pulse('pillFirst');
+    if (prev.last !== next.last) pulse('pillLast');
+
+    // feed rate (use hot uniques as a real “hits/min” signal)
+    if (el('feedRateVal')) el('feedRateVal').textContent = fmtNum(stats.hot_unique_ips ?? 0);
+
+    pushFeedPoint(Number(stats.hot_unique_ips ?? 0));
+    drawFeedChart();
+  }
+
+  /* -------------------- validated hits table -------------------- */
+
+  function rowSig(rows) {
+    if (!rows || !rows.length) return '';
+    return rows.map((r) => `${r.ip}|${r.last_seen}|${r.seen_count}|${r._run}`).join(';');
+  }
+
+  function renderRows(rows) {
+    const tb = el('rowsBody');
+    if (!tb) return;
+
+    const sig = rowSig(rows);
+    if (sig === state.lastRowsSig) return;
+    state.lastRowsSig = sig;
+
+    const currentRun = state.activeRun;
+
+    tb.innerHTML = '';
+    for (const r of rows) {
+      const tr = document.createElement('tr');
+      tr.className =
+        'ipRow ' +
+        ((r._run && currentRun && r._run === currentRun) ? 'currentRun' : 'prevRun');
+
+      const td = (v) => {
+        const x = document.createElement('td');
+        x.textContent = v;
+        return x;
+      };
+
+      tr.appendChild(td(r.ip || ''));
+      tr.appendChild(td(r.port != null ? String(r.port) : ''));
+      tr.appendChild(td(r.source || ''));
+      tr.appendChild(td(fmtTs(r.first_seen)));
+      tr.appendChild(td(fmtTs(r.last_seen)));
+      tr.appendChild(td(fmtNum(r.seen_count)));
+
+      tb.appendChild(tr);
+
+      // new row animation: scale then settle
+      if (r._isNew) {
+        tr.classList.add('newIp');
+        requestAnimationFrame(() => {
+          setTimeout(() => tr.classList.add('settle'), 30);
+          setTimeout(() => {
+            tr.classList.remove('newIp');
+            tr.classList.remove('settle');
+          }, 1150);
+        });
+      }
+    }
+  }
+
+  /* -------------------- terminal tail -------------------- */
+
+  function appendConsole(text) {
+    if (!text) return;
+    const c = el('console');
+    if (!c) return;
+
+    const atBottom = (c.scrollHeight - c.scrollTop - c.clientHeight) < 30;
+    c.textContent += text;
+
+    // cap (keep last ~160kb)
+    if (c.textContent.length > 160000) {
+      c.textContent = c.textContent.slice(-120000);
+    }
+    if (atBottom) c.scrollTop = c.scrollHeight;
+  }
+
+  async function pollTail() {
+    try {
+      const r = await fetch(`/api/tail?key=${encodeURIComponent(state.tailKey)}`);
+      const j = await r.json();
+      if (j && j.text) appendConsole(j.text);
+
+      if (el('tailTag')) el('tailTag').textContent = j && j.source ? j.source : '—';
+      if (el('lastUpdateTag')) {
+        el('lastUpdateTag').textContent = new Date().toISOString().replace('T', ' ').replace('Z', 'Z');
+      }
+    } catch {}
+  }
+
+  /* -------------------- run + db polling -------------------- */
+
+  async function pollLatestRun() {
+    try {
+      const r = await fetch('/api/run/latest');
+      const j = await r.json();
+
+      if (!j || !j.meta) {
+        state.activeRun = null;
+        setMeta(null, null);
+        setHeaderFacts(null, null, null);
+        return;
+      }
+
+      state.activeRun = j.meta.run_table || null;
+
+      // server may expose either naming
+      const firstEver =
+        (j.meta && (j.meta.first_ever_created_at || j.meta.firstEverCreatedAt)) ||
+        j.first_ever_created_at ||
+        j.firstEverCreatedAt ||
+        null;
+
+      setMeta(j.meta, j.block || null);
+      setHeaderFacts(j.meta, j.block || null, firstEver);
+
+      // keep pills + table refreshing whenever we have an active run
+      await pollDbStats();
+      await pollRows();
+    } catch {}
+  }
+
+  async function pollDbStats() {
+    if (!state.activeRun) return;
+    try {
+      const r = await fetch(`/api/run/${encodeURIComponent(state.activeRun)}/stats`);
+      const j = await r.json();
+      applyDbStats(j);
+    } catch {}
+  }
+
+  async function pollRows() {
+    if (!state.activeRun) return;
+    try {
+      const r = await fetch(`/api/run/${encodeURIComponent(state.activeRun)}/rows?limit=50`);
+      const j = await r.json();
+
+      const rows = Array.isArray(j) ? j : [];
+      renderRows(rows);
+
+      if (el('rowsTag')) el('rowsTag').textContent = `${rows.length} rows`;
+    } catch {}
+  }
+
+  /* -------------------- grazing log (blocks) -------------------- */
+
+  function renderBlocks(rows) {
+    const ul = el('blocksList');
+    if (!ul) return;
+
+    ul.innerHTML = '';
+    if (!rows.length) {
+      const li = document.createElement('li');
+      li.className = 'muted';
+      li.textContent = 'no blocks yet';
+      ul.appendChild(li);
+      return;
+    }
+
+    for (const b of rows) {
+      const li = document.createElement('li');
+      const left = document.createElement('span');
+      left.className = 'b';
+      left.textContent = b.ip_block || '—';
+
+      const right = document.createElement('span');
+      right.className = 't';
+      right.textContent = b.picked_at ? fmtTs(b.picked_at) : '—';
+
+      li.appendChild(left);
+      li.appendChild(right);
+      ul.appendChild(li);
+    }
+  }
+
+  async function pollBlocks() {
+    try {
+      const r = await fetch('/api/blocks/recent?limit=8');
+      const j = await r.json();
+      const rows = Array.isArray(j) ? j : [];
+      renderBlocks(rows);
+      if (el('blocksTag')) el('blocksTag').textContent = `${rows.length} blocks`;
+    } catch {}
+  }
+
+  /* -------------------- scheduler -------------------- */
+
+  function updateScheduleUi() {
+    const st = scheduleState || {};
+    const armed = !!st.armed;
+
+    if (el('schedState')) el('schedState').textContent = armed ? 'ARMED' : 'DISARMED';
+
+    if (armed && st.nextRunAtMs && Number.isFinite(Number(st.nextRunAtMs))) {
+      const ms = Number(st.nextRunAtMs) - Date.now();
+      if (el('countdown')) el('countdown').textContent = fmtMs(ms);
+    } else {
+      if (el('countdown')) el('countdown').textContent = '—';
+    }
+
+    // lock controls during run
+    const controls = document.querySelector('.panel.controls');
+    if (controls) {
+      if (st.running) controls.classList.add('isRunning');
+      else controls.classList.remove('isRunning');
+    }
+  }
+
+  async function fetchSchedule(reset) {
+    try {
+      const r = await fetch(`/api/schedule/status${reset ? '?reset=1' : ''}`);
+      const j = await r.json();
+      scheduleState = j;
+      updateScheduleUi();
+    } catch {}
+  }
+
+  async function armSchedule() {
+    const raw = (el('delayMin') && el('delayMin').value != null) ? String(el('delayMin').value) : '';
+    const vMin = Number(raw);
+    if (!Number.isFinite(vMin) || vMin <= 0) {
+      if (el('schedState')) el('schedState').textContent = 'ERR';
+      appendConsole(`[ui] invalid intake cycle minutes: "${raw}"\n`);
+      return;
+    }
+
+    const delaySec = Math.max(1, Math.round(vMin * 60));
+
+    try {
+      const r = await fetch('/api/schedule/arm', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ delaySec })
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        if (el('schedState')) el('schedState').textContent = 'ERR';
+        appendConsole(`[ui] arm failed (${r.status}): ${j && j.error ? j.error : 'unknown error'}\n`);
+        return;
+      }
+      scheduleState = j;
+      updateScheduleUi();
+      await fetchSchedule(true);
+    } catch (e) {
+      if (el('schedState')) el('schedState').textContent = 'ERR';
+      appendConsole(`[ui] arm failed: ${String(e && e.message ? e.message : e)}\n`);
+    }
+  }
+
+  async function disarmSchedule() {
+    try {
+      await fetch('/api/schedule/disarm', { method: 'POST' });
+      await fetchSchedule(true);
+    } catch {}
+  }
+
+  async function runNow() {
+    try {
+      await fetch('/api/schedule/run-now', { method: 'POST' });
+      await fetchSchedule(true);
+    } catch {}
+  }
+
+  function applyActionButtonClasses() {
+    const armBtn = el('armBtn');
+    const disarmBtn = el('disarmBtn');
+    const runNowBtn = el('runNowBtn');
+
+    if (armBtn) armBtn.classList.add('btn-ok');
+    if (disarmBtn) disarmBtn.classList.add('btn-danger');
+    if (runNowBtn) runNowBtn.classList.add('btn-run');
+  }
+
+  /* -------------------- feed chart -------------------- */
+
+  function pushFeedPoint(v) {
+    if (!Number.isFinite(v)) v = 0;
+    state.feedSeries.push(v);
+    if (state.feedSeries.length > state.feedMaxPoints) {
+      state.feedSeries.splice(0, state.feedSeries.length - state.feedMaxPoints);
+    }
+  }
+
+  function drawFeedChart() {
+    const canvas = el('feedChart');
+    if (!canvas) return;
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const w = canvas.width;
+    const h = canvas.height;
+    ctx.clearRect(0, 0, w, h);
+
+    const series = state.feedSeries;
+    if (!series.length) return;
+
+    const max = Math.max(1, ...series);
+    const pad = 12;
+
+    // resolve colors from current state
+    const cs = getComputedStyle(document.body);
+    const accentA = (cs.getPropertyValue('--accent-a') || '#19C2A0').trim();
+    const accentB = (cs.getPropertyValue('--accent-b') || '#2BA6F7').trim();
+    const text2 = (cs.getPropertyValue('--text2') || '#A3E5D8').trim();
+
+    // background grid
+    ctx.globalAlpha = 0.22;
+    ctx.strokeStyle = text2;
+    ctx.lineWidth = 1;
+    for (let i = 1; i < 6; i++) {
+      const y = pad + ((h - pad * 2) * i) / 6;
+      ctx.beginPath();
+      ctx.moveTo(pad, y);
+      ctx.lineTo(w - pad, y);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+
+    // line
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = accentA;
+    ctx.beginPath();
+
+    for (let i = 0; i < series.length; i++) {
+      const x = pad + ((w - pad * 2) * i) / Math.max(1, (series.length - 1));
+      const y = h - pad - ((h - pad * 2) * (series[i] / max));
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+
+    // glow line
+    ctx.globalAlpha = 0.25;
+    ctx.lineWidth = 6;
+    ctx.strokeStyle = accentB;
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  /* -------------------- init -------------------- */
+
+  function init() {
+    initUiState();
+
+    // remove noPulse once JS is live (prevents initial flash animation)
+    document.body.classList.remove('noPulse');
+
+    // toggle wiring
+    el('stateIdleBtn')?.addEventListener('click', () => setUiState('idle'));
+    el('stateGrazingBtn')?.addEventListener('click', () => setUiState('grazing'));
+    el('stateIngestBtn')?.addEventListener('click', () => setUiState('ingesting'));
+
+    // “INGEST” button is a UI preview: toggles ingesting state (no backend behavior)
+    document.querySelector('.btnEnergy')?.addEventListener('click', () => setUiState('ingesting'));
+
+    // action button styling classes
+    applyActionButtonClasses();
+
+    // scheduler wiring
+    el('schedForm')?.addEventListener('submit', (e) => {
+      e.preventDefault();
+      armSchedule();
+    });
+    el('disarmBtn')?.addEventListener('click', disarmSchedule);
+    el('runNowBtn')?.addEventListener('click', runNow);
+
+    // polls
+    setInterval(pollTail, 1000);
+    setInterval(() => fetchSchedule(false), 1000);
+    setInterval(pollLatestRun, 2000);
+    setInterval(pollBlocks, 4000);
+
+    // kick
+    pollTail();
+    fetchSchedule(true);
+    pollLatestRun();
+    pollBlocks();
+  }
+
+  init();
+})();
+
+---safe_scan.js---
+#!/usr/bin/env node
+'use strict';
+
+/**
+README — Streaming IP Ingest → SQLite (per-run tables)
+
+Plain-text logging:
+- All script logs are appended to ./runOutput.txt
+- Each console line = one log line
+- No JSON, no stdout interference
+*/
+
+//
+// CONFIGURATION
+//
+
+const DB_PATH = './online.sqlite';
+
+const PORT = 80;
+const SOURCE = 'authorized';
+
+const BLOCKS_FILE = './allowed_blocks.txt';
+const BLOCKS_NAMESPACE = 'allowed_blocks_v1';
+
+const RUN_OUTPUT_PATH = './runOutput.txt';
+
+const TTL_DAYS = 7;
+const DROP_RUNS_OLDER_THAN_DAYS = 30;
+
+const BATCH_SIZE = 5000;
+const ENABLE_STRICT_IP_VALIDATION = true;
+const MAX_LINE_LENGTH = 512;
+
+const ENABLE_BLOOM = true;
+const SCAN_SIZE_EXPECTED_UNIQUES = 5_000_000;
+const BLOOM_TARGET_FP = 0.0001;
+const BLOOM_GROWTH_FACTOR = 2.0;
+const BLOOM_MAX_BYTES = 128 * 1024 * 1024;
+
+const SCAN_N_BLOCKS = parseInt(process.env.SCAN_N_BLOCKS || '5', 10);
+
+// Producer command for THIS script (set this to whatever you run)
+// Example:
+// const PRODUCER_CMD = 'cat';
+// const PRODUCER_ARGS_TEMPLATE = (ipBlock) => [ './ips.txt' ];
+//
+// You currently build args inline below; keep it that way if you prefer.
+const PRODUCER_CMD = 'zmap'; // <-- set me
+
+// Optional variables for a zmap-style producer (only used if you build args that way)
+const ZMAP_RATE_PPS = '5000';
+const ZMAP_COOLDOWN = '5';
+
+//
+// END CONFIGURATION
+//
+
+const { spawn } = require('child_process');
+const readline = require('readline');
+const net = require('net');
+const crypto = require('crypto');
+const path = require('path');
+const fs = require('fs');
+const { iterateBlocks } = require('./iterateBlocks');
+
+let sqlite3;
+try {
+    sqlite3 = require('sqlite3');
+} catch {
+    console.error('Missing dependency: sqlite3');
+    process.exit(1);
+}
+
+/* -------------------- utils -------------------- */
+
+function nowSec() { return Math.floor(Date.now() / 1000); }
+function daysToSeconds(d) { return Math.floor(d * 86400); }
+function sanitizeIdent(s) { return String(s).replace(/[^a-zA-Z0-9_]/g, '_'); }
+
+function makeRunId() {
+    const d = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    const stamp =
+        `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}_` +
+        `${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+    const rand = crypto.randomBytes(3).toString('hex');
+    return `run_${stamp}_${rand}`;
+}
+
+/* -------------------- PLAIN TEXT LOGGER -------------------- */
+
+function createTextLogger(filePath) {
+    const abs = path.resolve(filePath);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+
+    // Clear log at process start
+    try { fs.writeFileSync(abs, ''); } catch { }
+
+    const ws = fs.createWriteStream(abs, { flags: 'a' });
+
+    function write(line) {
+        const s = String(line ?? '');
+        ws.write(s.endsWith('\n') ? s : s + '\n');
+    }
+
+    return {
+        info(msg) { write(msg); },
+        warn(msg) { write(`WARN: ${msg}`); },
+        error(msg) { write(`ERROR: ${msg}`); },
+        raw(_stream, chunk) {
+            const text = Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk ?? '');
+            ws.write(text);
+        },
+        close() {
+            try { ws.end(); } catch { }
+        },
+        path: abs,
+    };
+}
+
+/* -------------------- sqlite helpers -------------------- */
+
+function run(db, sql, params = []) {
+    return new Promise((resolve, reject) => {
+        db.run(sql, params, function (err) {
+            if (err) reject(err);
+            else resolve(this);
+        });
+    });
+}
+
+function all(db, sql, params = []) {
+    return new Promise((resolve, reject) => {
+        db.all(sql, params, function (err, rows) {
+            if (err) reject(err);
+            else resolve(rows);
+        });
+    });
+}
+
+function closeDb(db) {
+    return new Promise((resolve) => {
+        try { db.close(() => resolve()); } catch { resolve(); }
+    });
+}
+
+/* -------------------- IP extraction -------------------- */
+
+function extractIp(line) {
+    const t = String(line || '').trim();
+    if (!t) return null;
+
+    const s = t.replace(/^\[|\]$/g, '');
+    if (net.isIP(s)) return s;
+
+    const m4 = s.match(/^(\d{1,3}(?:\.\d{1,3}){3}):\d+$/);
+    if (m4 && net.isIP(m4[1])) return m4[1];
+
+    const m6 = t.match(/^\[([^\]]+)\]:(\d+)$/);
+    if (m6 && net.isIP(m6[1])) return m6[1];
+
+    return null;
+}
+
+/* -------------------- main -------------------- */
+
+(async function main() {
+  const log = createTextLogger(RUN_OUTPUT_PATH);
+  log.info(`Logging to ${log.path}`);
+
+  if (!PRODUCER_CMD) {
+    log.error('PRODUCER_CMD is empty. Set PRODUCER_CMD in config.');
+    throw new Error('PRODUCER_CMD is empty. Set PRODUCER_CMD in config.');
+  }
+
+  fs.mkdirSync(path.dirname(path.resolve(DB_PATH)), { recursive: true });
+  const db = new sqlite3.Database(DB_PATH);
+
+  // Soft-failure policy: do NOT stop the whole loop on one block failure.
+  // We'll only stop on "hard" setup failures (like iterateBlocks returning nothing).
+  let hardAbort = false;
+
+  for (let scanIndex = 1; scanIndex <= SCAN_N_BLOCKS; scanIndex++) {
+    if (hardAbort) break;
+
+    const runTable = sanitizeIdent(makeRunId());
+    let metaInserted = false;
+    let runTableCreated = false;
+
+    try {
+      await run(db, `
+        CREATE TABLE IF NOT EXISTS runs_meta (
+          run_table TEXT PRIMARY KEY,
+          created_at INTEGER NOT NULL,
+          port INTEGER NOT NULL,
+          source TEXT NOT NULL
+        );
+      `);
+
+      await run(db, `
+        CREATE TABLE IF NOT EXISTS run_block (
+          run_table TEXT PRIMARY KEY,
+          ip_block TEXT NOT NULL,
+          ip_block_start INTEGER NOT NULL,
+          ip_block_end INTEGER NOT NULL,
+          ip_block_file TEXT NOT NULL,
+          ip_block_namespace TEXT NOT NULL,
+          picked_at INTEGER NOT NULL
+        );
+      `);
+
+      // Per-run table first
+      await run(db, `
+        CREATE TABLE IF NOT EXISTS "${runTable}" (
+          ip TEXT PRIMARY KEY,
+          port INTEGER NOT NULL,
+          source TEXT NOT NULL,
+          first_seen INTEGER NOT NULL,
+          last_seen INTEGER NOT NULL,
+          seen_count INTEGER NOT NULL
+        );
+      `);
+      runTableCreated = true;
+
+      await run(db, `CREATE INDEX IF NOT EXISTS "idx_${runTable}_last_seen" ON "${runTable}"(last_seen);`);
+
+      await run(db,
+        `INSERT INTO runs_meta(run_table, created_at, port, source) VALUES(?,?,?,?)`,
+        [runTable, nowSec(), PORT, SOURCE]
+      );
+      metaInserted = true;
+
+      // Pick a block
+      const blockIter = await iterateBlocks(db, BLOCKS_FILE, {
+        namespace: BLOCKS_NAMESPACE,
+        runId: runTable,
+        ignoreBlank: true,
+      });
+
+      const picked = await blockIter.nextMeta();
+      if (!picked || !picked.text) {
+        log.error('iterateBlocks returned empty block (hard abort)');
+        hardAbort = true;
+        throw new Error('iterateBlocks returned empty block');
+      }
+
+      const IP_BLOCK = picked.text.trim();
+      log.info(`Scanning block ${scanIndex}/${SCAN_N_BLOCKS}: ${IP_BLOCK}`);
+
+      await run(db, `
+        INSERT INTO run_block
+        (run_table, ip_block, ip_block_start, ip_block_end, ip_block_file, ip_block_namespace, picked_at)
+        VALUES (?,?,?,?,?,?,?)
+      `, [
+        runTable,
+        IP_BLOCK,
+        picked.startByte,
+        picked.endByte,
+        path.resolve(BLOCKS_FILE),
+        BLOCKS_NAMESPACE,
+        nowSec(),
+      ]);
+
+      const PRODUCER_ARGS = [
+        '-p', String(PORT),
+        IP_BLOCK,
+        '-r', ZMAP_RATE_PPS,
+        '--cooldown-time', ZMAP_COOLDOWN,
+        '-q',
+        '-i', 'ens6',
+        '--gateway-mac', '82:01:fa:1c:fa:1d'
+      ];
+
+      const child = spawn(PRODUCER_CMD, PRODUCER_ARGS, {
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+
+      child.stderr.on('data', (d) => log.raw('child_stderr', d));
+
+      const rl = readline.createInterface({ input: child.stdout });
+
+      // Always resolve; never throw from close handler
+      const childCloseP = new Promise((resolve) => {
+        child.on('close', (code, signal) => {
+          try { rl.close(); } catch {}
+          resolve({ code, signal });
+        });
+      });
+
+      // Soft failure: record error but continue to next block
+      let childErrored = false;
+      child.on('error', (err) => {
+        childErrored = true;
+        log.error(`Producer error: ${err.message}`);
+        try { rl.close(); } catch {}
+      });
+
+      const stmt = db.prepare(`
+        INSERT INTO "${runTable}" (ip, port, source, first_seen, last_seen, seen_count)
+        VALUES (?, ?, ?, ?, ?, 1)
+        ON CONFLICT(ip) DO UPDATE SET
+          last_seen=excluded.last_seen,
+          seen_count="${runTable}".seen_count+1
+      `);
+
+      let total = 0;
+
+      for await (const line of rl) {
+        if (line.length > MAX_LINE_LENGTH) continue;
+        const ip = extractIp(line);
+        if (!ip) continue;
+        if (ENABLE_STRICT_IP_VALIDATION && net.isIP(ip) === 0) continue;
+
+        try {
+          stmt.run(ip, PORT, SOURCE, nowSec(), nowSec());
+          total++;
+        } catch (e) {
+          // Soft: ignore edge-case stmt errors and keep reading
+        }
+      }
+
+      const { code, signal } = await childCloseP;
+
+      try { stmt.finalize(); } catch {}
+
+      // Soft failure: log but do NOT stop further blocks
+      if (childErrored || code !== 0) {
+        log.error(`Block failed (soft): runTable=${runTable} ip_block=${IP_BLOCK} code=${code} signal=${signal || ''}`);
+      }
+
+      log.info(`Run done (${total} rows)`);
+    } catch (e) {
+      // For soft failures, we still clean up stale meta so dashboard doesn't query missing tables,
+      // but we do NOT stop the loop unless hardAbort was set.
+      log.error(`Run failed; cleaning up: ${e && (e.stack || e.message) ? (e.stack || e.message) : String(e)}`);
+
+      try {
+        if (metaInserted) {
+          await run(db, `DELETE FROM run_block WHERE run_table=?`, [runTable]).catch(() => {});
+          await run(db, `DELETE FROM runs_meta WHERE run_table=?`, [runTable]).catch(() => {});
+        }
+      } catch {}
+
+      try {
+        if (runTableCreated) {
+          await run(db, `DROP TABLE IF EXISTS "${runTable}"`).catch(() => {});
+        }
+      } catch {}
+
+      // IMPORTANT: do NOT set hardAbort here; continue to next block
+    }
+  }
+
+  await closeDb(db);
+  log.info('All scans complete');
+  log.close();
+})().catch((e) => {
+  try {
+    fs.appendFileSync(
+      path.resolve(RUN_OUTPUT_PATH),
+      `FATAL: ${String(e && e.stack ? e.stack : e)}\n`
+    );
+  } catch {}
+  console.error(e);
+  process.exit(1);
+});
+
+
+---server.js---
+// --- server.js ---
+'use strict';
+
+// Load .env if present (dashboard-controlled vars)
+require('dotenv').config();
+
+const path = require('path');
+const express = require('express');
+
+const dashboardRoutes = require('./src/routes/dashboard');
+const scheduler = require('./src/lib/scheduler');
+
+const app = express();
+
+// View engine (Pug)
+app.set('views', path.join(__dirname, 'views'));
+app.set('view engine', 'pug');
+
+// Middleware
+app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: false }));
+
+// Static assets
+app.use('/public', express.static(path.join(__dirname, 'public')));
+
+// Routes
+app.use('/', dashboardRoutes);
+
+// Start scheduler background loop so the server runs scans based on dashboard delay
+scheduler.startBackgroundLoop();
+
+const port = Number(process.env.PORT || 3000);
+app.listen(port, () => {
+  // eslint-disable-next-line no-console
+  console.log(`[dashboard] listening on http://localhost:${port}`);
+});
+
+
+---src/lib/db.js---
+// --- src/lib/db.js ---
+'use strict';
+
+const sqlite3 = require('sqlite3');
+const crypto = require('crypto');
+
+function openDb(dbPath) {
+  return new sqlite3.Database(dbPath);
+}
+
+function run(db, sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.run(sql, params, function (err) {
+      if (err) reject(err);
+      else resolve(this);
+    });
+  });
+}
+
+function get(db, sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.get(sql, params, function (err, row) {
+      if (err) reject(err);
+      else resolve(row);
+    });
+  });
+}
+
+function all(db, sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.all(sql, params, function (err, rows) {
+      if (err) reject(err);
+      else resolve(rows);
+    });
+  });
+}
+
+function closeDb(db) {
+  return new Promise((resolve) => {
+    try { db.close(() => resolve()); } catch { resolve(); }
+  });
+}
+
+async function tableExists(db, tableName) {
+  const name = String(tableName || '');
+  if (!name) return false;
+  const row = await get(db, `SELECT name FROM sqlite_master WHERE type='table' AND name=?`, [name]).catch(() => null);
+  return !!(row && row.name);
+}
+
+function sha256(text) {
+  return crypto.createHash('sha256').update(String(text)).digest('hex');
+}
+
+module.exports = {
+  openDb,
+  run,
+  get,
+  all,
+  closeDb,
+  tableExists,
+  sha256
+};
+
+
+---src/lib/envfile.js---
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+
+const ENV_PATH = process.env.ENV_PATH || path.resolve('./.env');
+
+function parseEnv(text) {
+  const out = {};
+  const lines = String(text || '').split(/\r?\n/);
+  for (const line of lines) {
+    if (!line || /^\s*#/.test(line)) continue;
+    const idx = line.indexOf('=');
+    if (idx === -1) continue;
+    const k = line.slice(0, idx).trim();
+    let v = line.slice(idx + 1);
+    // keep raw value (no unescaping)
+    out[k] = v;
+  }
+  return out;
+}
+
+function serializeEnv(map, originalText) {
+  const origLines = String(originalText || '').split(/\r?\n/);
+  const seen = new Set();
+  const outLines = [];
+
+  for (const line of origLines) {
+    if (!line || /^\s*#/.test(line) || line.indexOf('=') === -1) {
+      outLines.push(line);
+      continue;
+    }
+    const idx = line.indexOf('=');
+    const k = line.slice(0, idx).trim();
+    if (Object.prototype.hasOwnProperty.call(map, k)) {
+      outLines.push(`${k}=${map[k]}`);
+      seen.add(k);
+    } else {
+      outLines.push(line);
+    }
+  }
+
+  // append any new keys
+  for (const [k, v] of Object.entries(map)) {
+    if (!seen.has(k)) outLines.push(`${k}=${v}`);
+  }
+
+  // trim trailing blank lines but keep final newline
+  while (outLines.length && outLines[outLines.length - 1] === '') outLines.pop();
+  return outLines.join('\n') + '\n';
+}
+
+function readEnvFile() {
+  try {
+    const raw = fs.readFileSync(ENV_PATH, 'utf8');
+    return { raw, map: parseEnv(raw) };
+  } catch {
+    return { raw: '', map: {} };
+  }
+}
+
+function writeEnvKey(key, value) {
+  const { raw, map } = readEnvFile();
+  map[key] = String(value);
+  const next = serializeEnv(map, raw);
+  fs.writeFileSync(ENV_PATH, next, 'utf8');
+  return { path: ENV_PATH, map };
+}
+
+function getEnvKey(key) {
+  const { map } = readEnvFile();
+  return map[key];
+}
+
+module.exports = { ENV_PATH, readEnvFile, writeEnvKey, getEnvKey };
+
+
+---src/lib/log-tail.js---
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+
+const LOG_PATH = process.env.LOG_PATH || path.resolve('./scan.log');
+const MAX_LOG_BYTES_PER_POLL = Number(process.env.MAX_LOG_BYTES_PER_POLL || (64 * 1024));
+
+const logStateByRun = new Map();
+
+function getLogState(runTable) {
+  if (!logStateByRun.has(runTable)) {
+    logStateByRun.set(runTable, {
+      offset: 0,
+      startedAtMs: Date.now(),
+      stats: {
+        total_lines: 0,
+        accepted: 0,
+        rejected: 0,
+        bloom_skipped: 0,
+        last_rate: null
+      }
+    });
+  }
+  return logStateByRun.get(runTable);
+}
+
+function resetLogState(runTable) {
+  logStateByRun.set(runTable, {
+    offset: 0,
+    startedAtMs: Date.now(),
+    stats: {
+      total_lines: 0,
+      accepted: 0,
+      rejected: 0,
+      bloom_skipped: 0,
+      last_rate: null
+    }
+  });
+}
+
+// Heuristic regexes based on safe_scan.js output
+const RX = {
+  total: /lines\s*processed[:=]\s*(\d+)/i,
+  accepted: /accepted[:=]\s*(\d+)/i,
+  rejected: /rejected[:=]\s*(\d+)/i,
+  bloom: /bloom(?:_skipped| skipped)?[:=]\s*(\d+)/i,
+  rate: /rate[:=]\s*([\d.]+)\s*(?:ips\/s|lines\/s)?/i
+};
+
+function parseStats(text, st) {
+  if (!text) return;
+  st.stats.total_lines += (text.match(/\n/g) || []).length;
+
+  let m;
+  if ((m = RX.accepted.exec(text))) st.stats.accepted = Number(m[1]);
+  if ((m = RX.rejected.exec(text))) st.stats.rejected = Number(m[1]);
+  if ((m = RX.bloom.exec(text))) st.stats.bloom_skipped = Number(m[1]);
+  if ((m = RX.rate.exec(text))) st.stats.last_rate = Number(m[1]);
+}
+
+function readNew(runTable) {
+  const st = getLogState(runTable);
+
+  let stat;
+  try {
+    stat = fs.statSync(LOG_PATH);
+  } catch {
+    return { text: '', offset: st.offset, missing: true, log_path: LOG_PATH, stats: st.stats };
+  }
+
+  if (stat.size < st.offset) st.offset = 0;
+
+  const start = st.offset;
+  const remaining = stat.size - start;
+  if (remaining <= 0) return { text: '', offset: st.offset, missing: false, log_path: LOG_PATH, stats: st.stats };
+
+  const toRead = Math.min(remaining, MAX_LOG_BYTES_PER_POLL);
+  const fd = fs.openSync(LOG_PATH, 'r');
+  try {
+    const buf = Buffer.allocUnsafe(toRead);
+    const n = fs.readSync(fd, buf, 0, toRead, start);
+    st.offset = start + n;
+    const text = buf.slice(0, n).toString('utf8');
+    parseStats(text, st);
+    return { text, offset: st.offset, missing: false, log_path: LOG_PATH, stats: st.stats };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+module.exports = { LOG_PATH, resetLogState, readNew };
+
+
+---src/lib/run-output.js---
+// --- src/lib/run-output.js ---
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+
+// Plain-text run output (one console line == one file line)
+const OUTPUT_TXT_PATH = process.env.RUN_OUTPUT_TXT_PATH || path.resolve('./runOutput.txt');
+
+// Small JSON state for status/meta/stats (NOT a log)
+const STATE_PATH = process.env.RUN_STATE_PATH || path.resolve('./runState.json');
+
+const MAX_STATE_BYTES = Number(process.env.RUN_STATE_MAX_BYTES || 64 * 1024);
+
+// per-client tail cursor for OUTPUT_TXT_PATH
+const tailTxtByKey = new Map(); // key -> { byteOffset: number }
+
+function ensureDir(p) {
+  try { fs.mkdirSync(path.dirname(p), { recursive: true }); } catch {}
+}
+
+function defaultState() {
+  return { running: false, meta: {}, stats: {}, updatedAtMs: 0 };
+}
+
+function readStateSafe() {
+  try {
+    const raw = fs.readFileSync(STATE_PATH, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return defaultState();
+    return {
+      running: !!parsed.running,
+      meta: (parsed.meta && typeof parsed.meta === 'object') ? parsed.meta : {},
+      stats: (parsed.stats && typeof parsed.stats === 'object') ? parsed.stats : {},
+      updatedAtMs: Number(parsed.updatedAtMs || 0) || 0
+    };
+  } catch {
+    return defaultState();
+  }
+}
+
+function writeStateSafe(state) {
+  const safe = {
+    running: !!state.running,
+    meta: state.meta && typeof state.meta === 'object' ? state.meta : {},
+    stats: state.stats && typeof state.stats === 'object' ? state.stats : {},
+    updatedAtMs: Date.now()
+  };
+  try {
+    ensureDir(STATE_PATH);
+    const out = JSON.stringify(safe);
+    if (Buffer.byteLength(out, 'utf8') <= MAX_STATE_BYTES) {
+      fs.writeFileSync(STATE_PATH, out, 'utf8');
+    }
+  } catch {
+    // ignore
+  }
+  return safe;
+}
+
+function peekState() {
+  return readStateSafe();
+}
+
+/**
+ * Tail OUTPUT_TXT_PATH as plain text.
+ * - Uses per-key byte offsets
+ * - `reset=1` jumps to EOF (UI clears and only shows fresh content)
+ */
+function tail(key, reset = false) {
+  const k = String(key || 'global');
+  const state = readStateSafe();
+
+  ensureDir(OUTPUT_TXT_PATH);
+
+  let st;
+  try {
+    st = fs.statSync(OUTPUT_TXT_PATH);
+  } catch {
+    // file missing => nothing to tail
+    tailTxtByKey.set(k, { byteOffset: 0 });
+    return {
+      ok: true,
+      running: !!state.running,
+      stats: state.stats || {},
+      meta: state.meta || {},
+      text: '',
+      source: 'runOutput.txt',
+      output_path: OUTPUT_TXT_PATH,
+      totalBytes: 0
+    };
+  }
+
+  if (reset || !tailTxtByKey.has(k)) {
+    tailTxtByKey.set(k, { byteOffset: st.size });
+    return {
+      ok: true,
+      running: !!state.running,
+      stats: state.stats || {},
+      meta: state.meta || {},
+      text: '',
+      source: 'runOutput.txt',
+      output_path: OUTPUT_TXT_PATH,
+      totalBytes: st.size
+    };
+  }
+
+  const cur = tailTxtByKey.get(k);
+  const from = Math.max(0, Number(cur.byteOffset || 0));
+  const to = st.size;
+
+  // handle truncation/rotation
+  const safeFrom = from > to ? 0 : from;
+
+  let text = '';
+  if (to > safeFrom) {
+    const fd = fs.openSync(OUTPUT_TXT_PATH, 'r');
+    try {
+      const len = to - safeFrom;
+      const buf = Buffer.allocUnsafe(len);
+      fs.readSync(fd, buf, 0, len, safeFrom);
+      text = buf.toString('utf8');
+    } finally {
+      fs.closeSync(fd);
+    }
+  }
+
+  cur.byteOffset = to;
+
+  return {
+    ok: true,
+    running: !!state.running,
+    stats: state.stats || {},
+    meta: state.meta || {},
+    text,
+    source: 'runOutput.txt',
+    output_path: OUTPUT_TXT_PATH,
+    totalBytes: to
+  };
+}
+
+/* ------------------- writer helpers ------------------- */
+
+function clearOutputFile() {
+  try {
+    ensureDir(OUTPUT_TXT_PATH);
+    fs.writeFileSync(OUTPUT_TXT_PATH, '', 'utf8');
+  } catch {
+    // ignore
+  }
+  // reset all client cursors so they don't “seek past” the new empty file
+  tailTxtByKey.clear();
+}
+
+function appendLine(line) {
+  const s = String(line ?? '');
+  try {
+    ensureDir(OUTPUT_TXT_PATH);
+    fs.appendFileSync(OUTPUT_TXT_PATH, s.endsWith('\n') ? s : (s + '\n'), 'utf8');
+  } catch {
+    // ignore
+  }
+}
+
+function beginRun(meta = {}) {
+  // requirement: new run clears run output
+  clearOutputFile();
+
+  writeStateSafe({
+    running: true,
+    meta: { ...meta, startedAtMs: Date.now() },
+    stats: {}
+  });
+
+  appendLine(`[dashboard] starting scan: ${meta.cmd || ''}`.trim());
+}
+
+function setStats(stats = {}) {
+  const st = readStateSafe();
+  writeStateSafe({ running: !!st.running, meta: st.meta || {}, stats: stats || {} });
+}
+
+function endRun(result = {}) {
+  const st = readStateSafe();
+  appendLine(
+    `[dashboard] scan ended: code=${result.code} signal=${result.signal}` +
+    (result.error ? ` error=${result.error}` : '')
+  );
+  writeStateSafe({
+    running: false,
+    meta: { ...(st.meta || {}), endedAtMs: Date.now(), result },
+    stats: st.stats || {}
+  });
+}
+
+module.exports = {
+  OUTPUT_TXT_PATH,
+  STATE_PATH,
+  peekState,
+  tail,
+  beginRun,
+  appendLine,
+  setStats,
+  endRun
+};
+
+
+---src/lib/scan-model.js---
+// --- scan-model.js ---
+'use strict';
+
+const { openDb, get, all, isSafeIdent } = require('./db');
+
+/**
+ * Defensive helpers so the dashboard never dies when:
+ * - runs_meta exists but the per-run table was deleted / never created
+ * - DB is fresh and tables don't exist yet
+ */
+
+async function tableExists(db, tableName) {
+  try {
+    const row = await get(db, `
+      SELECT name
+      FROM sqlite_master
+      WHERE type='table' AND name = ?
+      LIMIT 1
+    `, [tableName]);
+    return !!(row && row.name);
+  } catch {
+    return false;
+  }
+}
+
+async function safeHasCoreTables(db) {
+  // If the DB is new or schema not created yet, avoid throwing
+  const hasRuns = await tableExists(db, 'runs_meta');
+  const hasBlock = await tableExists(db, 'run_block');
+  return { hasRuns, hasBlock };
+}
+
+/**
+ * Returns the newest run that actually has a backing per-run table.
+ * If no valid run exists, returns null.
+ */
+async function getLatestRunMeta() {
+  const db = openDb();
+  try {
+    const { hasRuns } = await safeHasCoreTables(db);
+    if (!hasRuns) return null;
+
+    // Grab a small window of recent runs and pick the first whose table exists
+    const rows = await all(db, `
+      SELECT run_table, created_at, port, source,
+             (SELECT MIN(created_at) FROM runs_meta) AS first_ever_created_at
+      FROM runs_meta
+      ORDER BY created_at DESC
+      LIMIT 25
+    `);
+
+    for (const r of rows || []) {
+      if (!r || !r.run_table) continue;
+      if (!isSafeIdent(r.run_table)) continue;
+      const ok = await tableExists(db, r.run_table);
+      if (ok) return r;
+    }
+
+    return null;
+  } catch (e) {
+    // Never crash the dashboard due to schema or missing tables
+    return null;
+  } finally {
+    try { db.close(); } catch {}
+  }
+}
+
+async function getRunBlock(runTable) {
+  if (!isSafeIdent(runTable)) return null;
+
+  const db = openDb();
+  try {
+    const { hasBlock } = await safeHasCoreTables(db);
+    if (!hasBlock) return null;
+
+    const row = await get(db, `
+      SELECT
+        run_table,
+        ip_block,
+        ip_block_start,
+        ip_block_end,
+        ip_block_file,
+        ip_block_namespace,
+        picked_at
+      FROM run_block
+      WHERE run_table = ?
+      LIMIT 1
+    `, [runTable]);
+
+    return row || null;
+  } catch {
+    return null;
+  } finally {
+    try { db.close(); } catch {}
+  }
+}
+
+/**
+ * Stats shape matches the current client usage in /public/js/dashboard.js:
+ * - unique_ips
+ * - total_observations
+ * - ips_seen_last_60s
+ * - first_seen_min
+ * - last_seen_max
+ */
+async function getRunStats(runTable) {
+  if (!isSafeIdent(runTable)) return null;
+
+  const db = openDb();
+  try {
+    // If the per-run table doesn’t exist, return null (client will keep pills as-is)
+    if (!(await tableExists(db, runTable))) return null;
+
+    const stats = await get(db, `
+      SELECT
+        COUNT(*) AS unique_ips,
+        COALESCE(SUM(seen_count), 0) AS total_observations,
+        COALESCE(MIN(first_seen), 0) AS first_seen_min,
+        COALESCE(MAX(last_seen), 0) AS last_seen_max
+      FROM "${runTable}"
+    `);
+
+    const nowSec = Math.floor(Date.now() / 1000);
+
+    const hot = await get(db, `
+      SELECT COUNT(*) AS ips_seen_last_60s
+      FROM "${runTable}"
+      WHERE last_seen >= ?
+    `, [nowSec - 60]);
+
+    return {
+      unique_ips: Number(stats?.unique_ips || 0) || 0,
+      total_observations: Number(stats?.total_observations || 0) || 0,
+      first_seen_min: Number(stats?.first_seen_min || 0) || 0,
+      last_seen_max: Number(stats?.last_seen_max || 0) || 0,
+      ips_seen_last_60s: Number(hot?.ips_seen_last_60s || 0) || 0
+    };
+  } catch (e) {
+    // If meta points to a table that was never created (or got cleaned up), don't crash the dashboard.
+    if (e && (e.code === 'SQLITE_ERROR' || e.code === 'SQLITE_MISUSE')) return null;
+    throw e;
+  } finally {
+    try { db.close(); } catch {}
+  }
+}
+
+/**
+ * Latest rows for the run.
+ * Returned row shape matches client table rendering:
+ * ip, seen_count, last_seen, first_seen, source, port
+ */
+async function getLatestRows(runTable, limit = 200) {
+  if (!isSafeIdent(runTable)) return [];
+
+  const lim = Math.max(1, Math.min(500, Number(limit) || 200));
+  const db = openDb();
+  try {
+    if (!(await tableExists(db, runTable))) return [];
+
+    const rows = await all(db, `
+      SELECT ip, seen_count, last_seen, first_seen, source, port
+      FROM "${runTable}"
+      ORDER BY last_seen DESC
+      LIMIT ?
+    `, [lim]);
+
+    return Array.isArray(rows) ? rows : [];
+  } catch (e) {
+    if (e && (e.code === 'SQLITE_ERROR' || e.code === 'SQLITE_MISUSE')) return [];
+    throw e;
+  } finally {
+    try { db.close(); } catch {}
+  }
+}
+
+/**
+ * Convenience bundle for your /api/latest-run route:
+ * { meta, block, first_ever_created_at }
+ */
+async function getLatestRunBundle() {
+  const meta = await getLatestRunMeta();
+  if (!meta) {
+    return { meta: null, block: null, first_ever_created_at: null };
+  }
+  const block = await getRunBlock(meta.run_table);
+  const firstEver = Number(meta.first_ever_created_at || 0) || null;
+
+  return {
+    meta: {
+      run_table: meta.run_table,
+      created_at: Number(meta.created_at || 0) || 0,
+      port: Number(meta.port || 0) || 0,
+      source: meta.source || ''
+    },
+    block,
+    first_ever_created_at: firstEver
+  };
+}
+
+module.exports = {
+  getLatestRunMeta,
+  getRunBlock,
+  getRunStats,
+  getLatestRows,
+  getLatestRunBundle
+};
+
+
+---src/lib/scheduler.js---
+// --- src/lib/scheduler.js ---
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+const { spawn } = require('child_process');
+
+const runOutput = require('./run-output');
+const { writeEnvKey } = require('./envfile');
+
+const STATE_PATH = process.env.SCHED_STATE_PATH || path.resolve('./scheduleState.json');
+
+const DEFAULT_SCAN_CMD = process.env.SCAN_CMD || 'node safe_scan.js';
+
+const LOOP_MS = Number(process.env.SCHED_LOOP_MS || 500);
+
+let loopTimer = null;
+let runningChild = null;
+
+function defaultState() {
+  return {
+    armed: false,
+    delaySec: 0,
+    nextRunAtMs: null,
+    running: false,
+    startedByDashboard: false,
+    lastExit: null
+  };
+}
+
+function readState() {
+  try {
+    const raw = fs.readFileSync(STATE_PATH, 'utf8');
+    const j = JSON.parse(raw);
+    return { ...defaultState(), ...(j || {}) };
+  } catch {
+    return defaultState();
+  }
+}
+
+function writeState(next) {
+  const s = { ...defaultState(), ...(next || {}) };
+  try {
+    fs.mkdirSync(path.dirname(STATE_PATH), { recursive: true });
+    fs.writeFileSync(STATE_PATH, JSON.stringify(s), 'utf8');
+  } catch {}
+  return s;
+}
+
+function getState() {
+  return readState();
+}
+
+function computeNextRun(delaySec) {
+  const d = Math.max(1, Number(delaySec || 0));
+  return Date.now() + (d * 1000);
+}
+
+function arm(delaySec, source = 'dashboard') {
+  const d = Math.max(1, Number(delaySec || 0));
+  // keep delay persisted so the UI countdown is stable
+  writeEnvKey('SCAN_DELAY_SEC', String(d));
+
+  const next = writeState({
+    armed: true,
+    delaySec: d,
+    nextRunAtMs: computeNextRun(d),
+    startedByDashboard: source === 'dashboard'
+  });
+
+  return { ok: true, state: next };
+}
+
+function cancel(source = 'dashboard') {
+  const s = readState();
+  const next = writeState({
+    ...s,
+    armed: false,
+    nextRunAtMs: null,
+    startedByDashboard: source === 'dashboard'
+  });
+  return { ok: true, state: next };
+}
+
+function runNow(source = 'dashboard') {
+  const s = readState();
+  const delay = Math.max(1, Number(s.delaySec || 60));
+  const next = writeState({
+    ...s,
+    armed: true, // run-now implies “armed” for that cycle
+    delaySec: delay,
+    nextRunAtMs: Date.now() + 250, // very soon
+    startedByDashboard: source === 'dashboard'
+  });
+  return { ok: true, state: next };
+}
+
+function startBackgroundLoop(scanCmd = DEFAULT_SCAN_CMD) {
+  if (loopTimer) return;
+
+  loopTimer = setInterval(async () => {
+    const s = readState();
+
+    if (!s.armed || s.running) return;
+    if (!s.nextRunAtMs || Date.now() < s.nextRunAtMs) return;
+
+    // fire
+    writeState({ ...s, running: true, lastExit: null });
+
+    // new run clears output + marks state
+    runOutput.beginRun({ source: 'scheduler', cmd: scanCmd });
+
+    // IMPORTANT: don't pipe stdout into dashboard (zmap uses stdout for results).
+    // safe_scan.js should write to runOutput.txt itself.
+    runningChild = spawn('bash', ['-lc', scanCmd], {
+      stdio: ['ignore', 'ignore', 'pipe']
+    });
+
+    runningChild.stderr.on('data', (d) => {
+      try { runOutput.appendLine(String(d).trimEnd()); } catch {}
+    });
+
+    runningChild.on('close', (code, signal) => {
+      const s2 = readState();
+
+      const exit = { code, signal };
+      writeState({
+        ...s2,
+        running: false,
+        lastExit: exit,
+        nextRunAtMs: s2.armed ? computeNextRun(s2.delaySec || 60) : null
+      });
+
+      runOutput.endRun(exit);
+      runningChild = null;
+    });
+
+    runningChild.on('error', (err) => {
+      const s2 = readState();
+      const exit = { code: 1, signal: null, error: err.message };
+      writeState({ ...s2, running: false, lastExit: exit, armed: false, nextRunAtMs: null });
+      runOutput.endRun(exit);
+      runningChild = null;
+    });
+  }, LOOP_MS);
+}
+
+module.exports = {
+  startBackgroundLoop,
+  getState,
+  arm,
+  cancel,
+  runNow
+};
+
+
+---src/routes/dashboard.js---
+// --- src/routes/dashboard.js ---
+// Express router for the dashboard UI + API.
+//
+// This router is wired to the rest of the project:
+// - Scheduler state + run spawning is handled by src/lib/scheduler.js
+// - Run console output + tailing is handled by src/lib/run-output.js
+// - Run metadata + rows are read from the project's SQLite DB (default: ./online.sqlite)
+//
+// NOTE: DB access is best-effort and supports either `better-sqlite3` (sync) or `sqlite3` (async)
+// if either dependency is installed.
+
+'use strict';
+
+const path = require('path');
+const express = require('express');
+
+const scheduler = require('../lib/scheduler');
+const runOutput = require('../lib/run-output');
+
+const router = express.Router();
+
+// ---------------------------
+// Paths (project-root relative)
+// ---------------------------
+
+// __dirname is: <project>/src/routes
+const PROJECT_ROOT = path.resolve(__dirname, '..', '..');
+
+const DEFAULT_DB_PATH = path.join(PROJECT_ROOT, 'online.sqlite');
+
+// allow override via env; accept absolute or project-root relative
+const DB_PATH = process.env.DB_PATH
+  ? (path.isAbsolute(process.env.DB_PATH) ? process.env.DB_PATH : path.resolve(PROJECT_ROOT, process.env.DB_PATH))
+  : DEFAULT_DB_PATH;
+
+// For display only (tailing uses runOutput.OUTPUT_TXT_PATH)
+const OUTPUT_PATH = runOutput.OUTPUT_TXT_PATH;
+
+// ---------------------------
+// Optional SQLite (best-effort)
+// ---------------------------
+
+let sqlite = null;
+let db = null;
+
+// Support either better-sqlite3 or sqlite3 if installed.
+function tryInitDb() {
+  if (db) return db;
+
+  // better-sqlite3 (sync)
+  try {
+    // eslint-disable-next-line import/no-extraneous-dependencies
+    const BetterSqlite3 = require('better-sqlite3');
+    sqlite = { kind: 'better-sqlite3' };
+    db = new BetterSqlite3(DB_PATH, { readonly: true });
+    return db;
+  } catch (_) {}
+
+  // sqlite3 (async)
+  try {
+    // eslint-disable-next-line import/no-extraneous-dependencies
+    const sqlite3 = require('sqlite3');
+    sqlite = { kind: 'sqlite3', sqlite3 };
+    db = new sqlite3.Database(DB_PATH, sqlite3.OPEN_READONLY);
+    return db;
+  } catch (_) {}
+
+  return null;
+}
+
+function dbAll(sql, params = []) {
+  const dbc = tryInitDb();
+  if (!dbc) return Promise.reject(new Error('No sqlite driver found (install better-sqlite3 or sqlite3)'));
+
+  if (sqlite.kind === 'better-sqlite3') {
+    try {
+      const stmt = dbc.prepare(sql);
+      const rows = stmt.all(params);
+      return Promise.resolve(rows);
+    } catch (e) {
+      return Promise.reject(e);
+    }
+  }
+
+  return new Promise((resolve, reject) => {
+    dbc.all(sql, params, (err, rows) => (err ? reject(err) : resolve(rows)));
+  });
+}
+
+function dbGet(sql, params = []) {
+  const dbc = tryInitDb();
+  if (!dbc) return Promise.reject(new Error('No sqlite driver found (install better-sqlite3 or sqlite3)'));
+
+  if (sqlite.kind === 'better-sqlite3') {
+    try {
+      const stmt = dbc.prepare(sql);
+      const row = stmt.get(params);
+      return Promise.resolve(row);
+    } catch (e) {
+      return Promise.reject(e);
+    }
+  }
+
+  return new Promise((resolve, reject) => {
+    dbc.get(sql, params, (err, row) => (err ? reject(err) : resolve(row)));
+  });
+}
+
+function clamp(n, a, b) {
+  return Math.max(a, Math.min(b, n));
+}
+
+function safeTableName(input) {
+  const s = String(input || '');
+  // allow run_YYYYMMDD_HHMMSS_xxxxxx
+  const cleaned = s.replace(/[^a-zA-Z0-9_]/g, '');
+  return cleaned;
+}
+
+// ---------------------------
+// Page route (pug render)
+// ---------------------------
+
+router.get(['/', '/dashboard'], (req, res) => {
+  res.render('dashboard', {
+    cfg: {
+      dbPath: DB_PATH,
+      outputPath: OUTPUT_PATH
+    }
+  });
+});
+
+// ---------------------------
+// Tail endpoint (live console)
+// ---------------------------
+//
+// Client expects: { text, source, running, ... }
+
+router.get('/api/tail', (req, res) => {
+  const key = String(req.query.key || 'global');
+  const reset = String(req.query.reset || '0') === '1';
+
+  try {
+    const out = runOutput.tail(key, reset);
+    return res.json(out);
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+// ---------------------------
+// Run + DB endpoints
+// ---------------------------
+
+// Expected by client: /api/run/latest -> { meta, block, firstEverCreatedAt }
+router.get('/api/run/latest', async (req, res) => {
+  try {
+    // Prefer the most recent run whose per-run table still exists.
+    const meta = await dbGet(
+      `SELECT run_table, created_at, source, port
+       FROM runs_meta
+       WHERE run_table IN (
+         SELECT name FROM sqlite_master WHERE type='table'
+       )
+       ORDER BY created_at DESC
+       LIMIT 1`
+    ).catch(() => null);
+
+    const firstEver = await dbGet(
+      `SELECT MIN(created_at) AS first_ever_created_at FROM runs_meta`
+    ).catch(() => null);
+
+    let block = null;
+    if (meta && meta.run_table) {
+      block = await dbGet(
+        `SELECT ip_block, picked_at, ip_block_namespace, ip_block_file
+         FROM run_block
+         WHERE run_table = ?
+         ORDER BY picked_at DESC
+         LIMIT 1`,
+        [meta.run_table]
+      ).catch(() => null);
+    } else {
+      // fallback: latest block overall
+      block = await dbGet(
+        `SELECT ip_block, picked_at, ip_block_namespace, ip_block_file, run_table
+         FROM run_block
+         ORDER BY picked_at DESC
+         LIMIT 1`
+      ).catch(() => null);
+    }
+
+    return res.json({
+      meta: meta || null,
+      block: block || null,
+      firstEverCreatedAt: firstEver ? firstEver.first_ever_created_at : null
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+
+// Expected by client: /api/run/:run/stats -> stats object
+router.get('/api/run/:run/stats', async (req, res) => {
+  const run = safeTableName(req.params.run);
+  if (!run) return res.status(400).json({ ok: false, error: 'missing run' });
+
+  try {
+    const base = await dbGet(
+      `SELECT
+         COUNT(DISTINCT ip) AS unique_ips,
+         COUNT(1) AS total_observations,
+         MIN(first_seen) AS first_seen,
+         MAX(last_seen) AS last_seen
+       FROM "${run}"`
+    );
+
+    const nowSec = Math.floor(Date.now() / 1000);
+    const hot = await dbGet(
+      `SELECT COUNT(DISTINCT ip) AS hot_unique_ips
+       FROM "${run}"
+       WHERE last_seen >= ?`,
+      [nowSec - 60]
+    ).catch(() => ({ hot_unique_ips: 0 }));
+
+    return res.json({
+      unique_ips: base?.unique_ips ?? 0,
+      total_observations: base?.total_observations ?? 0,
+      hot_unique_ips: hot?.hot_unique_ips ?? 0,
+      first_seen: base?.first_seen ?? null,
+      last_seen: base?.last_seen ?? null
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+// Expected by client: /api/run/:run/rows?limit=50 -> array of rows
+router.get('/api/run/:run/rows', async (req, res) => {
+  const run = safeTableName(req.params.run);
+  const limit = clamp(Number(req.query.limit || 50), 1, 500);
+
+  if (!run) return res.status(400).json({ ok: false, error: 'missing run' });
+
+  try {
+    const rows = await dbAll(
+      `SELECT
+         ip,
+         port,
+         source,
+         first_seen,
+         last_seen,
+         seen_count,
+         "${run}" AS _run
+       FROM "${run}"
+       ORDER BY last_seen DESC
+       LIMIT ?`,
+      [limit]
+    ).catch(() => []);
+
+    return res.json(Array.isArray(rows) ? rows : []);
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+// ---------------------------
+// Recent blocks (grazing log)
+// ---------------------------
+
+router.get('/api/blocks/recent', async (req, res) => {
+  const limit = clamp(Number(req.query.limit || 8), 1, 50);
+
+  try {
+    const rows = await dbAll(
+      `SELECT
+         ip_block,
+         picked_at,
+         run_table,
+         ip_block_namespace,
+         ip_block_file
+       FROM run_block
+       ORDER BY picked_at DESC
+       LIMIT ?`,
+      [limit]
+    ).catch(() => []);
+
+    return res.json(Array.isArray(rows) ? rows : []);
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+// ---------------------------
+// Scheduler endpoints (persisted state)
+// ---------------------------
+
+// Client expects: /api/schedule/status -> { armed, delaySec, nextRunAtMs, running, ... }
+router.get('/api/schedule/status', (req, res) => {
+  res.json(scheduler.getState());
+});
+
+// POST { delaySec }
+router.post('/api/schedule/arm', express.json(), (req, res) => {
+  const delaySec = Number(req.body && req.body.delaySec);
+
+  if (!Number.isFinite(delaySec) || delaySec < 1) {
+    return res.status(400).json({ ok: false, error: 'delaySec must be >= 1' });
+  }
+
+  const out = scheduler.arm(delaySec, 'dashboard');
+  return res.json(out.state);
+});
+
+// POST (no body)
+router.post('/api/schedule/disarm', (req, res) => {
+  const out = scheduler.cancel('dashboard');
+  return res.json(out.state);
+});
+
+// Alias for older UIs that send “cancel”
+router.post('/api/schedule/cancel', (req, res) => {
+  const out = scheduler.cancel('dashboard');
+  return res.json(out.state);
+});
+
+// POST (no body)
+router.post('/api/schedule/run-now', (req, res) => {
+  const out = scheduler.runNow('dashboard');
+  return res.json(out.state);
+});
+
+module.exports = router;
+
+
+---validate_ip.js---
+'use strict';
+
+const fs = require('fs');
+const dns = require('dns').promises;
+const tls = require('tls');
+
+/* -------------------- utils -------------------- */
+
+function withTimeout(promise, ms, label = 'timeout') {
+  let t;
+  const timeout = new Promise((_, rej) => {
+    t = setTimeout(() => rej(new Error(label)), ms);
+  });
+  return Promise.race([promise.finally(() => clearTimeout(t)), timeout]);
+}
+
+function daysBetween(a, b) {
+  const ms = Math.abs(a.getTime() - b.getTime());
+  return ms / (1000 * 60 * 60 * 24);
+}
+
+function clamp(n, lo, hi) {
+  return Math.max(lo, Math.min(hi, n));
+}
+
+/* -------------------- IP helpers -------------------- */
+
+function parseIPv4ToU32(ip) {
+  const parts = ip.split('.');
+  if (parts.length !== 4) return null;
+  let n = 0;
+  for (const p of parts) {
+    const v = Number(p);
+    if (!Number.isInteger(v) || v < 0 || v > 255) return null;
+    n = (n << 8) | v;
+  }
+  return n >>> 0;
+}
+
+/* -------------------- rDNS -------------------- */
+
+function looksDefaultRdns(host) {
+  const h = host.toLowerCase();
+  const patterns = [
+    /\b\d{1,3}[-.]\d{1,3}[-.]\d{1,3}[-.]\d{1,3}\b/,
+    /(static|dyn|dynamic|host|vps|vm|server|srv|node)\b/,
+    /\b(ip|cust|customer)\b/,
+    /(compute|cloud|vultr|linode|digitalocean|ovh|hetzner|aws|amazon|googleusercontent|azure|leaseweb|contabo|scaleway)\b/,
+    /\bip[-.]\d{1,3}[-.]\d{1,3}[-.]\d{1,3}[-.]\d{1,3}\b/,
+  ];
+  return patterns.some((re) => re.test(h));
+}
+
+async function reverseDns(ip, timeoutMs = 1200) {
+  try {
+    const names = await withTimeout(dns.reverse(ip), timeoutMs);
+    return Array.isArray(names) ? names : [];
+  } catch {
+    return [];
+  }
+}
+
+/* -------------------- TLS (bonus-only) -------------------- */
+
+async function fetchTlsCertMeta(ip, timeoutMs = 1800, servername) {
+  return withTimeout(
+    new Promise((resolve) => {
+      const socket = tls.connect(
+        {
+          host: ip,
+          port: 443,
+          servername: servername || undefined,
+          rejectUnauthorized: false,
+        },
+        () => {
+          const cert = socket.getPeerCertificate(true);
+          socket.end();
+          if (!cert || !cert.valid_from) return resolve(null);
+          resolve({
+            valid_from: new Date(cert.valid_from),
+          });
+        }
+      );
+
+      socket.on('error', () => resolve(null));
+      socket.setTimeout(timeoutMs, () => {
+        socket.destroy();
+        resolve(null);
+      });
+    }),
+    timeoutMs + 200
+  );
+}
+
+/* -------------------- scoring -------------------- */
+
+const DEFAULT_WEIGHTS = Object.freeze({
+  datacenter_asn: 90,
+  defaultish_rdns: 5,
+  tls_age_le_7d: 5,
+  tls_age_le_30d: 3,
+  tls_age_le_90d: 1,
+});
+
+/* -------------------- precomputed index -------------------- */
+
+let _idx = null;
+
+function u32View(buf, offsetBytes, lengthU32) {
+  return new Uint32Array(buf.buffer, buf.byteOffset + offsetBytes, lengthU32);
+}
+
+function loadPrecomputed(indexBinPath, asnMapJsonPath) {
+  const buf = fs.readFileSync(indexBinPath);
+  if (buf.slice(0, 4).toString('utf8') !== 'ASNV') {
+    throw new Error('Invalid ASN index (bad magic)');
+  }
+
+  const version = buf.readUInt32LE(4);
+  if (version !== 1) {
+    throw new Error(`Unsupported ASN index version ${version}`);
+  }
+
+  const count = buf.readUInt32LE(8);
+  let off = 16;
+
+  const starts = u32View(buf, off, count); off += count * 4;
+  const ends   = u32View(buf, off, count); off += count * 4;
+  const asns   = u32View(buf, off, count); off += count * 4;
+  const prefix16 = u32View(buf, off, 65536 * 2);
+
+  const map = JSON.parse(fs.readFileSync(asnMapJsonPath, 'utf8'));
+  const asnList = Uint32Array.from(map.asn);
+  const isDcList = Uint8Array.from(map.isDc);
+
+  _idx = { starts, ends, asns, prefix16, asnList, isDcList };
+}
+
+/* -------------------- ASN lookup -------------------- */
+
+function binarySearchAsn(asnList, asn) {
+  let lo = 0, hi = asnList.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const v = asnList[mid];
+    if (v === asn) return mid;
+    if (v < asn) lo = mid + 1;
+    else hi = mid - 1;
+  }
+  return -1;
+}
+
+function binarySearchRange(starts, ends, asns, ipU32, lo, hiExclusive) {
+  let l = lo;
+  let r = hiExclusive - 1;
+  let idx = -1;
+
+  while (l <= r) {
+    const mid = (l + r) >> 1;
+    if (starts[mid] <= ipU32) {
+      idx = mid;
+      l = mid + 1;
+    } else {
+      r = mid - 1;
+    }
+  }
+
+  if (idx === -1) return null;
+  return ipU32 <= ends[idx] ? asns[idx] : null;
+}
+
+function lookupAsnAndDatacenter(ip) {
+  if (!_idx) return null;
+
+  const ipU32 = parseIPv4ToU32(ip);
+  if (ipU32 === null) return null;
+
+  const prefix = (ipU32 >>> 16) & 0xffff;
+  const lo = _idx.prefix16[prefix * 2];
+  const hi = _idx.prefix16[prefix * 2 + 1];
+
+  const asn = binarySearchRange(_idx.starts, _idx.ends, _idx.asns, ipU32, lo, hi);
+  if (!asn) return { asn: null, isDatacenter: false };
+
+  const pos = binarySearchAsn(_idx.asnList, asn);
+  const isDatacenter = pos >= 0 ? _idx.isDcList[pos] === 1 : false;
+
+  return { asn, isDatacenter };
+}
+
+/* -------------------- main API -------------------- */
+
+async function evaluateIp(ip, opts = {}) {
+  const {
+    indexBinPath,
+    asnMapJsonPath,
+    tlsServername,
+    enableRdns = true,
+    enableTlsAge = true,
+    weights = {},
+  } = opts;
+
+  if (!_idx) {
+    if (!indexBinPath || !asnMapJsonPath) {
+      throw new Error('Missing indexBinPath / asnMapJsonPath');
+    }
+    loadPrecomputed(indexBinPath, asnMapJsonPath);
+  }
+
+  const W = { ...DEFAULT_WEIGHTS, ...weights };
+  const reasons = [];
+  const signals = {};
+
+  /* ASN (primary) */
+  const asnInfo = lookupAsnAndDatacenter(ip);
+  signals.asn = asnInfo;
+
+  const isDatacenter = Boolean(asnInfo && asnInfo.isDatacenter);
+  if (isDatacenter) reasons.push('datacenter_asn');
+
+  /* rDNS (supporting) */
+  if (enableRdns) {
+    const rdns = await reverseDns(ip);
+    signals.rdns = rdns;
+    if (rdns.length && rdns.some(looksDefaultRdns)) {
+      reasons.push('defaultish_rdns');
+    }
+  }
+
+  /* TLS age (bonus-only) */
+  let ageHint = null;
+  if (enableTlsAge) {
+    const cert = await fetchTlsCertMeta(ip, 1800, tlsServername);
+    signals.tlsCert = cert;
+
+    if (cert && cert.valid_from instanceof Date) {
+      const ageDays = daysBetween(new Date(), cert.valid_from);
+      signals.tlsCertAgeDays = ageDays;
+
+      if (ageDays <= 7) { reasons.push('tls_age_le_7d'); ageHint = 'very_fresh_tls'; }
+      else if (ageDays <= 30) { reasons.push('tls_age_le_30d'); ageHint = 'fresh_tls'; }
+      else if (ageDays <= 90) { reasons.push('tls_age_le_90d'); ageHint = 'moderately_fresh_tls'; }
+      else { ageHint = 'older_tls'; }
+    }
+  }
+
+  const uniqReasons = [...new Set(reasons)];
+  let score = 0;
+  for (const r of uniqReasons) if (typeof W[r] === 'number') score += W[r];
+  score = clamp(score, 0, 100);
+
+  let label = 'datacenter_unlikely';
+  if (score >= 70) label = 'datacenter_likely';
+  else if (score >= 40) label = 'datacenter_possible';
+
+  return {
+    isDatacenter,   // ✅ NEW boolean (fast path)
+    score,
+    label,
+    ageHint,
+    reasons: uniqReasons,
+    signals,
+  };
+}
+
+module.exports = {
+  loadPrecomputed,
+  evaluateIp,
+
+  // exposed for testing / metrics
+  lookupAsnAndDatacenter,
+  DEFAULT_WEIGHTS,
+};
+
+
+---version-control/ALLOWED.txt---
+# scripts/ALLOWED.txt
+public/
+src/
+version-control/
+views/
+.env
+safe_scan.js
+server.js
+iterateBlocks.js
+validate_ip.js
+
+---version-control/dump-apply.js---
+// scripts/dump-apply.js
+const fs = require("fs");
+const path = require("path");
+const { validateDumpText } = require("./dump-validator");
+
+const ROOT = process.cwd();
+const STATE_PATH = path.join(ROOT, ".repo_state.json");
+const VERSIONS_DIR = path.join(ROOT, "versions");
+const README_DIR = path.join(VERSIONS_DIR, "readme");
+
+function ensureDir(p) {
+  fs.mkdirSync(p, { recursive: true });
+}
+
+function loadState() {
+  try {
+    return JSON.parse(fs.readFileSync(STATE_PATH, "utf8"));
+  } catch {
+    return { active: null, history: [] };
+  }
+}
+
+function saveState(state) {
+  fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2) + "\n");
+}
+
+function extractReadmeRaw(text) {
+  const start = text.indexOf("---README---\n");
+  if (start === -1) return null;
+  const end = text.indexOf("---__META__---", start);
+  return text
+    .slice(start + 13, end === -1 ? undefined : end)
+    .trimEnd();
+}
+
+function applyDumpFile(dumpPath) {
+  ensureDir(VERSIONS_DIR);
+  ensureDir(README_DIR);
+
+  const dumpText = fs.readFileSync(dumpPath, "utf8");
+  const parsed = validateDumpText(dumpText);
+
+  for (const w of parsed.warnings) {
+    console.warn(`[dump:apply] WARN: ${w}`);
+  }
+
+  for (const [rel, content] of parsed.files.entries()) {
+    const outPath = path.join(ROOT, rel);
+    fs.mkdirSync(path.dirname(outPath), { recursive: true });
+    fs.writeFileSync(outPath, content, "utf8");
+  }
+
+  const readme =
+    parsed.readmeText || extractReadmeRaw(dumpText);
+
+  if (readme) {
+    const out = path.join(
+      README_DIR,
+      `README_${parsed.meta.version}.md`
+    );
+    fs.writeFileSync(out, readme + "\n");
+  }
+
+  const state = loadState();
+  const entry = {
+    version: parsed.meta.version,
+    appliedAt: new Date().toISOString(),
+    fileCount: parsed.files.size,
+  };
+
+  state.active = entry;
+  state.history.push(entry);
+  saveState(state);
+
+  return entry;
+}
+
+if (require.main === module) {
+  const dumpPath = process.argv[2] || "dump.txt";
+  const res = applyDumpFile(dumpPath);
+  console.log(`Applied ${res.version}`);
+}
+
+module.exports = { applyDumpFile };
+
+
+---version-control/dump-prompt.txt---
+“Apply these changes to the current canonical repo state. This is a multi-file change requiring a full dump. Output ONLY a downloadable dump.txt (no inline full files). Dump must be lexicographically ordered ---filename--- sections, exclude middleware/fingerer.js, and include a final ---__META__--- JSON footer with version, sha256 of content above footer, and manifest matching the dump entries exactly.”
+
+---version-control/dump-undo.js---
+// scripts/dump-undo.js
+const fs = require("fs");
+const path = require("path");
+const { validateDumpText } = require("./dump-validator");
+const { applyDumpFile } = require("./dump-apply");
+
+const ROOT = process.cwd();
+const STATE_PATH = path.join(ROOT, ".repo_state.json");
+
+const VERSIONS_DIR = path.join(ROOT, "versions");
+
+function loadState() {
+  try {
+    return JSON.parse(fs.readFileSync(STATE_PATH, "utf8"));
+  } catch {
+    return { active: null, history: [] };
+  }
+}
+
+function dumpPathForVersion(version) {
+  return path.join(VERSIONS_DIR, `dump_${version}.txt`);
+}
+
+function warn(msg) {
+  console.warn(`[dump:undo] ${msg}`);
+}
+
+function info(msg) {
+  console.log(`[dump:undo] ${msg}`);
+}
+
+/**
+ * Roll back the codebase to the rollback target declared by the current ACTIVE version's README.
+ * If the rollback target can't be determined or the target dump file can't be found, do nothing and warn.
+ */
+function undoToActiveRollbackTarget() {
+  const state = loadState();
+
+  if (!state.active || !state.active.version) {
+    warn("No active version found in .repo_state.json. Nothing to undo.");
+    return { didUndo: false, reason: "no-active" };
+  }
+
+  const activeVersion = String(state.active.version);
+  const activeDumpPath = dumpPathForVersion(activeVersion);
+
+  if (!fs.existsSync(activeDumpPath)) {
+    warn(`Active dump file not found: ${path.relative(ROOT, activeDumpPath)}. Nothing to undo.`);
+    return { didUndo: false, reason: "active-dump-missing" };
+  }
+
+  // Read active dump and extract README rollback target (legacy-friendly)
+  let parsed;
+  try {
+    const dumpText = fs.readFileSync(activeDumpPath, "utf8");
+    parsed = validateDumpText(dumpText);
+  } catch (e) {
+    warn(`Failed to parse active dump (${path.relative(ROOT, activeDumpPath)}): ${e.message}`);
+    warn("Nothing to undo.");
+    return { didUndo: false, reason: "active-dump-invalid" };
+  }
+
+  function extractRollbackTarget(parsed) {
+  // Primary: validator-parsed fields
+  if (parsed && parsed.readmeValidation && parsed.readmeValidation.fields) {
+    const v = String(parsed.readmeValidation.fields.rollbackTarget || '').trim();
+    if (v) return v;
+  }
+
+  // Fallback: raw README text
+  const text = parsed && parsed.readmeText ? String(parsed.readmeText) : '';
+  const line = text.split(/\r?\n/).find((l) => /^\s*Rollback target\s*:/i.test(l));
+  if (!line) return '';
+  const m = line.match(/Rollback target\s*:\s*(.+)\s*$/i);
+  return m ? String(m[1]).trim() : '';
+}
+
+  const rollbackTarget = extractRollbackTarget(parsed);
+  if (!rollbackTarget) {
+    warn(`Active version ${activeVersion} README is missing Rollback target. Nothing to undo.`);
+    return { didUndo: false, reason: "no-rollback-target" };
+  }
+
+  const targetDumpPath = dumpPathForVersion(rollbackTarget);
+
+  if (!fs.existsSync(targetDumpPath)) {
+    warn(
+      `Rollback target dump not found: ${path.relative(ROOT, targetDumpPath)}. ` +
+        `No changes applied.`
+    );
+    return { didUndo: false, reason: "target-dump-missing", rollbackTarget };
+  }
+
+  info(`Active version: ${activeVersion}`);
+  info(`Rollback target: ${rollbackTarget}`);
+  info(`Applying: ${path.relative(ROOT, targetDumpPath)}`);
+
+  // Apply the target dump (this updates .repo_state.json and extracts README sidecar per your rules)
+  const result = applyDumpFile(targetDumpPath, { allowDelete: false });
+
+  info(`Rollback complete. Active is now ${result.version}`);
+  return { didUndo: true, from: activeVersion, to: result.version };
+}
+
+// CLI:
+// node scripts/dump-undo.js
+// npm run dump:undo
+if (require.main === module) {
+  try {
+    const res = undoToActiveRollbackTarget();
+    if (!res.didUndo) process.exitCode = 0;
+  } catch (e) {
+    warn(e.message || String(e));
+    process.exitCode = 1;
+  }
+}
+
+module.exports = { undoToActiveRollbackTarget };
+
+
+---version-control/dump-validator.js---
+// scripts/dump-validator.js
+const path = require("path");
+const fs = require("fs");
+
+const ROOT = process.cwd();
+const ALLOWED_PATH = path.join(__dirname, "ALLOWED.txt");
+
+const FORBIDDEN = new Set(["middleware/fingerer.js"]);
+
+function isBoundaryLine(line) {
+  return /^---[^-\n].*---$/.test(line.trim());
+}
+
+function boundaryName(line) {
+  return line.trim().slice(3, -3);
+}
+
+function normalizeRel(p) {
+  return String(p).replace(/\\/g, "/").replace(/^\/+/, "").trim();
+}
+
+function compareLex(a, b) {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/* ================= ALLOW POLICY ================= */
+
+function loadAllowPolicy() {
+  if (!fs.existsSync(ALLOWED_PATH)) {
+    return { enabled: false };
+  }
+
+  const lines = fs
+    .readFileSync(ALLOWED_PATH, "utf8")
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .filter((l) => !l.startsWith("#"));
+
+  const exact = new Set();
+  const dirs = [];
+
+  for (const l of lines) {
+    if (l.endsWith("/")) {
+      dirs.push(l);
+    } else {
+      exact.add(l);
+    }
+  }
+
+  return { enabled: true, exact, dirs };
+}
+
+function isAllowed(rel, policy) {
+  if (FORBIDDEN.has(rel)) return false;
+  if (!policy.enabled) return true;
+  if (policy.exact.has(rel)) return true;
+  return policy.dirs.some((d) => rel.startsWith(d));
+}
+
+/* ================= DUMP VALIDATION ================= */
+
+function validateDumpText(dumpText) {
+  const warnings = [];
+
+  if (typeof dumpText !== "string" || !dumpText.length) {
+    throw new Error("dump is empty or invalid");
+  }
+
+  const metaBoundary = "---__META__---\n";
+  const idx = dumpText.lastIndexOf(metaBoundary);
+  if (idx === -1) throw new Error("Missing __META__ footer");
+
+  const headerText = dumpText.slice(0, idx);
+  const metaText = dumpText.slice(idx + metaBoundary.length);
+
+  let meta;
+  try {
+    meta = JSON.parse(metaText.trim());
+  } catch {
+    throw new Error("Invalid __META__ JSON");
+  }
+
+  if (!meta.version || typeof meta.version !== "string") {
+    throw new Error("__META__.version is required");
+  }
+
+  if ("sha256" in meta) {
+    warnings.push("__META__.sha256 ignored (hashing removed)");
+  }
+
+  const lines = headerText.split("\n");
+  const files = new Map();
+
+  let current = null;
+  let buf = [];
+  let inReadme = false;
+  let readmeBuf = [];
+
+  function flush() {
+    if (current) files.set(current, buf.join("\n"));
+    current = null;
+    buf = [];
+  }
+
+  for (const line of lines) {
+    if (isBoundaryLine(line)) {
+      const name = normalizeRel(boundaryName(line));
+
+      if (name === "README") {
+        flush();
+        inReadme = true;
+        continue;
+      }
+
+      if (inReadme) throw new Error("File found after README");
+
+      if (files.has(name)) throw new Error(`Duplicate file: ${name}`);
+      if (FORBIDDEN.has(name)) throw new Error(`Forbidden file: ${name}`);
+
+      flush();
+      current = name;
+      continue;
+    }
+
+    if (inReadme) {
+      readmeBuf.push(line);
+    } else if (current) {
+      buf.push(line);
+    } else if (line.trim() !== "") {
+      throw new Error("Content before first file boundary");
+    }
+  }
+
+  flush();
+
+  if (!files.size) throw new Error("No files in dump");
+
+  if (Array.isArray(meta.manifest)) {
+    const actual = [...files.keys()];
+    if (meta.manifest.length !== actual.length) {
+      warnings.push("manifest length mismatch (warn-only)");
+    }
+  } else {
+    warnings.push("__META__.manifest missing/invalid (warn-only)");
+  }
+
+  const policy = loadAllowPolicy();
+  if (policy.enabled) {
+    for (const rel of files.keys()) {
+      if (!isAllowed(rel, policy)) {
+        throw new Error(`File not allowed by ALLOWED.txt: ${rel}`);
+      }
+    }
+  }
+
+  const readmeText = readmeBuf.length ? readmeBuf.join("\n").trimEnd() : null;
+
+  function parseReadmeFields(text) {
+    if (!text) return { fields: {}, ok: false };
+
+    const fields = {};
+    const lines = String(text).split(/\r?\n/);
+
+    for (const line of lines) {
+      // Simple "Key: Value" extraction (kept intentionally strict & readable)
+      const m = line.match(/^\s*([A-Za-z][A-Za-z _-]{1,40})\s*:\s*(.+?)\s*$/);
+      if (!m) continue;
+
+      const keyRaw = m[1].trim().toLowerCase().replace(/[-\s]+/g, " ");
+      const value = m[2].trim();
+
+      if (keyRaw === "rollback target") fields.rollbackTarget = value;
+      else if (keyRaw === "version") fields.version = value;
+      else if (keyRaw === "state") fields.state = value;
+    }
+
+    return { fields, ok: Object.keys(fields).length > 0 };
+  }
+
+  const readmeValidation = parseReadmeFields(readmeText);
+
+  return {
+    files,
+    meta,
+    readmeText,
+    readmeValidation,
+    warnings,
+  };
+}
+
+module.exports = { validateDumpText };
+
+---version-control/generate-dump.js---
+// scripts/generate-dump.js
+const fs = require("fs");
+const path = require("path");
+
+const ROOT = process.cwd();
+const STATE_PATH = path.join(ROOT, ".repo_state.json");
+const VERSIONS_DIR = path.join(ROOT, "versions");
+
+function ensureDir(p) {
+  fs.mkdirSync(p, { recursive: true });
+}
+
+function loadState() {
+  try {
+    return JSON.parse(fs.readFileSync(STATE_PATH, "utf8"));
+  } catch {
+    return { active: null };
+  }
+}
+
+function loadAllowed() {
+  const p = path.join(__dirname, "ALLOWED.txt");
+  if (!fs.existsSync(p)) throw new Error("Missing scripts/ALLOWED.txt");
+
+  return fs
+    .readFileSync(p, "utf8")
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .filter((l) => !l.startsWith("#"));
+}
+
+function collectFiles(list) {
+  const out = [];
+
+  for (const entry of list) {
+    const abs = path.join(ROOT, entry);
+    if (!fs.existsSync(abs)) continue;
+
+    const st = fs.statSync(abs);
+    if (st.isFile()) out.push(entry);
+    else if (st.isDirectory()) walk(abs, entry, out);
+  }
+
+  return out.sort();
+}
+
+function walk(abs, rel, out) {
+  for (const name of fs.readdirSync(abs)) {
+    const a = path.join(abs, name);
+    const r = path.posix.join(rel, name);
+    const st = fs.statSync(a);
+    if (st.isDirectory()) walk(a, r, out);
+    else if (st.isFile()) out.push(r);
+  }
+}
+
+function generateDump() {
+  ensureDir(VERSIONS_DIR);
+
+  const state = loadState();
+  const version =
+    process.env.npm_config_version ||
+    state.active?.version ||
+    "v0.0.0";
+
+  const allowed = loadAllowed();
+  const files = collectFiles(allowed);
+
+  let body = "";
+  const manifest = [];
+
+  for (const rel of files) {
+    const content = fs.readFileSync(path.join(ROOT, rel), "utf8");
+    body += `---${rel}---\n${content}\n`;
+    manifest.push(rel);
+  }
+
+  const rollbackTarget =
+    state.active?.version && state.active.version !== version
+      ? String(state.active.version)
+      : '';
+
+  const dump =
+    body +
+    `---README---
+` +
+    `# Dump README
+
+` +
+    `Version: ${version}
+` +
+    `State: grazing
+` +
+    (rollbackTarget ? `Rollback target: ${rollbackTarget}
+` : ``) +
+    `
+Generated snapshot.
+
+` +
+    `---__META__---
+` +
+    JSON.stringify(
+      {
+        version,
+        manifest,
+      },
+      null,
+      2
+    ) +
+    "
+";
+
+  const outPath = path.join(VERSIONS_DIR, `dump_${version}.txt`);
+  fs.writeFileSync(outPath, dump, "utf8");
+
+  console.log(`Generated ${path.relative(ROOT, outPath)}`);
+}
+
+if (require.main === module) {
+  generateDump();
+}
+
+module.exports = { generateDump };
+
+
+---version-control/print-active.js---
+// scripts/print-active.js
+const fs = require("fs");
+const path = require("path");
+
+const STATE_PATH = path.join(process.cwd(), ".repo_state.json");
+
+function printActive() {
+  if (!fs.existsSync(STATE_PATH)) {
+    console.log("No repo state found. No dump has been applied yet.");
+    process.exit(0);
+  }
+
+  let state;
+  try {
+    state = JSON.parse(fs.readFileSync(STATE_PATH, "utf8"));
+  } catch {
+    console.error("Failed to read .repo_state.json (corrupt JSON)");
+    process.exit(1);
+  }
+
+  if (!state.active) {
+    console.log("Repo state exists, but no active dump is set.");
+    process.exit(0);
+  }
+
+  const a = state.active;
+
+  console.log("Active repo dump");
+  console.log("----------------");
+  console.log(`Version    : ${a.version}`);
+  if (a.sha256) console.log(`SHA256     : ${a.sha256}`);
+  console.log(`Applied at : ${a.appliedAt}`);
+  console.log(`Files      : ${a.fileCount}`);
+
+  if (Array.isArray(state.history)) {
+    console.log(`History    : ${state.history.length} total applied dumps`);
+  }
+}
+
+if (require.main === module) {
+  printActive();
+}
+
+module.exports = { printActive };
+
+
+---views/dashboard.pug---
+extends layout
+
+block content
+  main.dash
+    header.topbar
+      .brand
+        .mark(aria-hidden="true")
+        .word SYNGEST
+        .stateTag
+          span#uiStateLabel GRAZING
+          span.dots ...
+      .topMeta
+        .facts
+          .fact
+            span.k Last block
+            span.v#hLastBlock —
+          .fact
+            span.k Last graze
+            span.v#hLastTime —
+          .fact
+            span.k First hit
+            span.v#hFirstEver —
+        .toggle
+          button.stateBtn#stateIdleBtn(type="button" title="Idle") IDLE
+          button.stateBtn.active#stateGrazingBtn(type="button" title="Grazing") GRAZING
+          button.stateBtn#stateIngestBtn(type="button" title="Ingesting") INGESTING
+        .tagRow
+          span.tag RUN:
+          span.mono#activeRunTag —
+          span.sep ·
+          span.tag DB:
+          span.mono #{cfg.dbPath}
+          span.sep ·
+          span.tag OUTPUT:
+          span.mono #{cfg.outputPath}
+
+    section.pills
+      .pill#pillUnique
+        span.label TOTAL FOUND
+        span.value#pUnique 0
+      .pill#pillTotal
+        span.label TOTAL GRAZED
+        span.value#pTotal 0
+      .pill#pillHot
+        span.label HOT
+        span.value#pHot 0
+      .pill#pillFirst
+        span.label FIRST HIT
+        span.value#pFirst —
+      .pill#pillLast
+        span.label LAST HIT
+        span.value#pLast —
+
+    section.grid
+      //- Left rail (visual only)
+      nav.rail(aria-label="Navigation")
+        button.railBtn(type="button" aria-label="Overview")
+          span.ico ⌂
+        button.railBtn(type="button" aria-label="Sources")
+          span.ico ◎
+        button.railBtn(type="button" aria-label="Logs")
+          span.ico ≋
+        button.railBtn(type="button" aria-label="Search")
+          span.ico ⌕
+        .railSep
+        button.railBtn(type="button" aria-label="Settings")
+          span.ico ⚙
+
+      //- Main content column
+      .col
+        .row
+          .panel.feed
+            .panelHead
+              .h
+                span.title Feed rate
+                span.sub / minute
+              .right
+                button.btnEnergy(type="button" title="Ingest") INGEST
+            .panelBody
+              .feedTop
+                .feedVal
+                  span.big#feedRateVal —
+                  span.unit hits/min
+                .miniMeta
+                  div
+                    span.k PORT
+                    span.v.mono#mPort —
+                  div
+                    span.k SOURCE
+                    span.v.mono#mSource —
+              canvas#feedChart(width="560" height="160" aria-label="Feed rate chart")
+          .panel.blocks
+            .panelHead
+              .h
+                span.title Grazing log reminder
+                span.sub recent blocks
+              .right
+                span.chip#blocksTag —
+            .panelBody
+              ul.blocksList#blocksList
+                li.muted waiting…
+
+        .row
+          .panel.hits
+            .panelHead
+              .h
+                span.title Validated hits
+                span.sub recent finds
+              .right
+                span.chip#rowsTag —
+            .panelBody
+              .tableWrap
+                table.table
+                  thead
+                    tr
+                      th IP
+                      th Port
+                      th Source
+                      th First hit
+                      th Last hit
+                      th Seen
+                  tbody#rowsBody
+                    tr
+                      td(colspan="6").muted waiting…
+
+          .stack
+            .panel.terminal
+              .panelHead
+                .h
+                  span.title Terminal
+                  span.sub run output
+                .right
+                  span.tag TAIL:
+                  span.mono#tailTag —
+                  span.sep ·
+                  span.tag UPDATED:
+                  span.mono#lastUpdateTag —
+              .panelBody
+                pre.console#console
+
+            .panel.controls
+              .panelHead
+                .h
+                  span.title Grazer controls
+                  span.sub scheduling + run
+                .right
+                  span.chip#schedState —
+              .panelBody
+                form#schedForm
+                  .fieldRow
+                    label(for="delayMin") Intake cycle (minutes)
+                    input#delayMin(type="number" min="1" step="1" value="15")
+                  .btnRow
+                    button#armBtn(type="submit") Arm
+                    button#disarmBtn(type="button") Disarm
+                    button#runNowBtn(type="button") Graze now
+                  .nextRow
+                    span.k Next graze
+                    span.v.mono#countdown —
+                  .note
+                    span.k Run
+                    span.v.mono#mRun —
+                    span.sep ·
+                    span.k Created
+                    span.v.mono#mCreated —
+                    span.sep ·
+                    span.k Block
+                    span.v.mono#mBlock —
+
+---views/error.pug---
+extends layout
+
+block content
+  main(style="padding:18px")
+    h1(style="font-family: var(--mono); margin: 0 0 10px") #{title}
+    p(style="font-family: var(--mono); color: var(--muted)") #{message}
+    if status
+      p(style="font-family: var(--mono); color: var(--muted)") status=#{status}
+
+
+---views/layout.pug---
+doctype html
+html(lang="en")
+  head
+    meta(charset="utf-8")
+    meta(name="viewport", content="width=device-width, initial-scale=1")
+    title #{title}
+    link(rel="stylesheet", href="/public/css/terminal.css")
+  //- Default to grazing visuals; JS can toggle later and persist.
+  body(class="scanlines state-grazing noPulse")
+    //- scanlines MUST be its own layer (so it doesn't collide with body:before grid)
+    div.scanlinesOverlay(aria-hidden="true")
+    //- subtle “signal grid” layer
+    div.laser3(aria-hidden="true")
+    //- rare “connection loss fuzz” overlay (toggled by JS)
+    div.fuzzOverlay(aria-hidden="true")
+    block content
+    script(src="/public/js/dashboard.js" defer)
+
+---README---
+# Dump README
+
+Version: v0.0.1
+State: grazing
+Rollback target: v0.0.0
+
+Syngest feeds the Anabolic Repo.
+
+## Changes in this version
+
+- Dashboard restyled to match the reference: glass panels, top state bar, stat pills, left rail.
+- Prominent **Validated hits** table (recent IPs) + sticky header.
+- Live **Terminal** tail panel for run output.
+- **Grazer controls** panel: intake cycle, arm/disarm, graze now, and countdown.
+- **Feed rate** panel with a sparkline chart driven by real DB stats (hot unique IPs in the last minute).
+- Added a three-state UI toggle (Idle / Grazing / Ingesting) persisted to localStorage for later workflows.
+- Added API: `/api/blocks/recent` for the Grazing log panel.
+- Hardened `/api/run/latest` to ignore stale runs whose per-run table no longer exists.
+- Version-control scripts now understand README fields (rollback target) and print-active won’t expect sha256.
+
+
+---__META__---
+{
+  "version": "v0.0.1",
+  "sha256": "6c61412df66beeb174d8d5c27ce73179e300b312e72cc0cfa6263fa31c0ffa68",
+  "manifest": [
+    ".env",
+    "iterateBlocks.js",
+    "public/css/terminal.css",
+    "public/js/dashboard.js",
+    "safe_scan.js",
+    "server.js",
+    "src/lib/db.js",
+    "src/lib/envfile.js",
+    "src/lib/log-tail.js",
+    "src/lib/run-output.js",
+    "src/lib/scan-model.js",
+    "src/lib/scheduler.js",
+    "src/routes/dashboard.js",
+    "validate_ip.js",
+    "version-control/ALLOWED.txt",
+    "version-control/dump-apply.js",
+    "version-control/dump-prompt.txt",
+    "version-control/dump-undo.js",
+    "version-control/dump-validator.js",
+    "version-control/generate-dump.js",
+    "version-control/print-active.js",
+    "views/dashboard.pug",
+    "views/error.pug",
+    "views/layout.pug"
+  ]
+}

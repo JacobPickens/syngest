@@ -155,9 +155,13 @@ router.get('/api/tail', (req, res) => {
 // Expected by client: /api/run/latest -> { meta, block, firstEverCreatedAt }
 router.get('/api/run/latest', async (req, res) => {
   try {
+    // Prefer the most recent run whose per-run table still exists.
     const meta = await dbGet(
       `SELECT run_table, created_at, source, port
        FROM runs_meta
+       WHERE run_table IN (
+         SELECT name FROM sqlite_master WHERE type='table'
+       )
        ORDER BY created_at DESC
        LIMIT 1`
     ).catch(() => null);
@@ -195,6 +199,7 @@ router.get('/api/run/latest', async (req, res) => {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
+
 
 // Expected by client: /api/run/:run/stats -> stats object
 router.get('/api/run/:run/stats', async (req, res) => {
@@ -261,6 +266,33 @@ router.get('/api/run/:run/rows', async (req, res) => {
 });
 
 // ---------------------------
+// Recent blocks (grazing log)
+// ---------------------------
+
+router.get('/api/blocks/recent', async (req, res) => {
+  const limit = clamp(Number(req.query.limit || 8), 1, 50);
+
+  try {
+    const rows = await dbAll(
+      `SELECT
+         ip_block,
+         picked_at,
+         run_table,
+         ip_block_namespace,
+         ip_block_file
+       FROM run_block
+       ORDER BY picked_at DESC
+       LIMIT ?`,
+      [limit]
+    ).catch(() => []);
+
+    return res.json(Array.isArray(rows) ? rows : []);
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+// ---------------------------
 // Scheduler endpoints (persisted state)
 // ---------------------------
 
@@ -300,3 +332,4 @@ router.post('/api/schedule/run-now', (req, res) => {
 });
 
 module.exports = router;
+

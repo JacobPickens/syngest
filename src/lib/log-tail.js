@@ -90,3 +90,4 @@ function readNew(runTable) {
 }
 
 module.exports = { LOG_PATH, resetLogState, readNew };
+

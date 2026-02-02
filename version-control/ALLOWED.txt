@@ -1,0 +1,10 @@
+# scripts/ALLOWED.txt
+public/
+src/
+version-control/
+views/
+.env
+safe_scan.js
+server.js
+iterateBlocks.js
+validate_ip.js
