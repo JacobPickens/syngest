@@ -506,6 +506,34 @@
     ctx.globalAlpha = 1;
   }
 
+
+  function lockStateButtons() {
+    const ids = ['stateIdleBtn', 'stateGrazingBtn', 'stateIngestBtn'];
+
+    for (const id of ids) {
+      const b = el(id);
+      if (!b) continue;
+
+      // Hard-disable: markup + runtime (defense-in-depth)
+      b.disabled = true;
+      b.setAttribute('aria-disabled', 'true');
+      b.setAttribute('tabindex', '-1');
+
+      // Prevent any stray listeners (now or in future)
+      b.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+      }, { capture: true });
+
+      b.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          e.stopPropagation();
+        }
+      }, { capture: true });
+    }
+  }
+
   /* -------------------- init -------------------- */
 
   function init() {
@@ -515,7 +543,8 @@
     // remove noPulse once JS is live (prevents initial flash animation)
     document.body.classList.remove('noPulse');
 
-    // State buttons are display-only (disabled in markup).
+    // State buttons are display-only; UI state is driven by bot status.
+    lockStateButtons();
 
     // action button styling classes
     applyActionButtonClasses();
