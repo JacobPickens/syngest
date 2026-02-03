@@ -8,7 +8,7 @@ const IS_MAIN = import.meta.url === pathToFileURL(process.argv[1]).href;
 if (IS_MAIN) {
   const dumpPath = process.argv[2];
   if (!dumpPath) {
-    console.error("Usage: npm run dump:undo -- <dump-file>");
+    console.error("Usage: npm run dump:undo -- <dump_vX.Y.Z[.zip]>");
     process.exit(1);
   }
 

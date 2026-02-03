@@ -1,9 +1,9 @@
 {
   "active": {
-    "version": "v0.2.5",
+    "version": "v0.2.7",
     "toolchainVersion": "v1.2.0",
-    "appliedAt": "2026-02-03T02:09:56.837Z",
-    "fileCount": 37
+    "appliedAt": "2026-02-03T07:22:01.123Z",
+    "fileCount": 46
   },
   "history": [
     {
@@ -28,6 +28,12 @@
       "toolchainVersion": "v1.2.0",
       "appliedAt": "2026-02-03T02:09:56.837Z",
       "fileCount": 37
+    },
+    {
+      "version": "v0.2.7",
+      "toolchainVersion": "v1.2.0",
+      "appliedAt": "2026-02-03T07:22:01.123Z",
+      "fileCount": 46
     }
   ]
 }

@@ -130,10 +130,21 @@ export function applyDumpAuto(input) {
 
 /**
  * Compatibility helper: apply by file path (zip or raw dump).
+ *
+ * Accepts paths with or without a .zip extension.
  */
 export function applyDumpFile(filePath) {
   const abs = path.resolve(String(filePath));
-  const buf = fs.readFileSync(abs);
+
+  // If the caller omitted ".zip", transparently try the zip form.
+  // This makes: `npm run dump:apply -- versions/dump_v0.2.7` work.
+  let resolved = abs;
+  if (!fs.existsSync(resolved) && !resolved.toLowerCase().endsWith(".zip")) {
+    const withZip = resolved + ".zip";
+    if (fs.existsSync(withZip)) resolved = withZip;
+  }
+
+  const buf = fs.readFileSync(resolved);
   return applyDumpAuto(buf);
 }
 
@@ -144,7 +155,7 @@ const IS_MAIN = import.meta.url === pathToFileURL(process.argv[1]).href;
 if (IS_MAIN) {
   const filePath = process.argv[2];
   if (!filePath) {
-    console.error("Usage: node dump-apply.js <dump_vX.Y.Z.zip>");
+    console.error("Usage: node dump-apply.js <dump_vX.Y.Z[.zip]>");
     process.exit(1);
   }
 

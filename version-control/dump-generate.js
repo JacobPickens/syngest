@@ -51,7 +51,6 @@ export function generateDump(files, options = {}) {
 
     // hard safety: never include toolchain/system paths even if passed explicitly
     if (
-      norm.startsWith("version-control/") ||
       norm.startsWith("scripts/") ||
       norm.startsWith("bin/") ||
       norm.startsWith("node_modules/") ||
@@ -188,7 +187,12 @@ if (IS_MAIN) {
 
     fs.mkdirSync(VERSIONS_DIR, { recursive: true });
 
-    const outPath = args.out || path.join(VERSIONS_DIR, `dump_${args.version}.zip`);
+    // Allow callers to omit the .zip extension.
+    // Example: --out=versions/dump_v0.2.7  -> writes versions/dump_v0.2.7.zip
+    let outPath = args.out || path.join(VERSIONS_DIR, `dump_${args.version}.zip`);
+    if (outPath && !String(outPath).toLowerCase().endsWith(".zip")) {
+      outPath = String(outPath) + ".zip";
+    }
     const files = args._.length ? args._ : collectFiles(ROOT);
 
     const zipBuf = generateDumpZip(files, {

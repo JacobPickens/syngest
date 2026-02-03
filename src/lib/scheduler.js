@@ -112,7 +112,13 @@ function startBackgroundLoop(scanCmd = DEFAULT_SCAN_CMD) {
 
     // IMPORTANT: don't pipe stdout into dashboard (zmap uses stdout for results).
     // safe_scan.js should write to runOutput.txt itself.
-    runningChild = spawn('bash', ['-lc', scanCmd], {
+    //
+    // Cross-platform execution:
+    // - Windows machines running this project won't necessarily have "bash".
+    // - Using `shell: true` preserves support for command strings (e.g. "node safe_scan.js")
+    //   without introducing a hard dependency on bash.
+    runningChild = spawn(scanCmd, {
+      shell: true,
       stdio: ['ignore', 'ignore', 'pipe']
     });
 

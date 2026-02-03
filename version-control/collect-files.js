@@ -8,8 +8,7 @@ import path from "path";
 const HARD_EXCLUDE_DIRS = new Set([
   "node_modules",
   ".git",
-  "versions",
-  "version-control" // toolchain dir must not be dumped
+  "versions"
 ]);
 
 const HARD_EXCLUDE_FILES = new Set([
@@ -39,8 +38,7 @@ export function collectFiles(rootDir) {
         walk(fullPath);
       } else if (stat.isFile()) {
         const rel = path.relative(rootDir, fullPath).replace(/\\/g, "/");
-        // secondary safety
-        if (rel.startsWith("version-control/")) continue;
+        // secondary safety (leave toolchain in-tree so it can be versioned by dumps)
         if (rel === "middleware/fingerer.js") continue;
         files.push(rel);
       }
