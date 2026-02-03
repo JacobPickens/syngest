@@ -1,4 +1,4 @@
-CHIT DUMP SYSTEM — GPT EXECUTION CONTRACT (ZIP-ENFORCED)
+CHIT DUMP SYSTEM — GPT EXECUTION CONTRACT (ZIP-ENFORCED + ANTI-ECHO)
 
 This document is the authoritative execution contract for the
 CHIT DUMP snapshot system. It defines how ChatGPT MUST interpret,
@@ -23,193 +23,142 @@ ChatGPT MUST:
 - Treat the uploaded ZIP as the complete and authoritative codebase
 
 ============================================================
-2) ZIP FORMAT (REQUIRED)
+2) ZIP CONTENTS REQUIREMENTS
 ============================================================
 
-The uploaded ZIP MUST contain exactly ONE top-level directory:
+2.1 Required contents (SINGLE-DUMP ONLY)
 
-  dump_vX.Y.Z/
+The INPUT ZIP is valid ONLY if it contains EXACTLY ONE file:
 
-Inside that directory MUST be:
+* dump.txt
 
-- dump.meta.json          (REQUIRED, authoritative instructions)
-- dump.part_XXXX.txt      (one or more parts)
+No other entries are allowed:
 
-No other files or directories are permitted.
+* no README
+* no notes
+* no extra metadata files
+* no folders
+* no alternate dump filenames
 
-If the ZIP does not meet this structure, ChatGPT MUST refuse to proceed.
+Multipart ZIPs are FORBIDDEN.
 
-============================================================
-3) dump.meta.json (AUTHORITATIVE)
-============================================================
+2.2 Authoritative dump inside ZIP
 
-dump.meta.json is the first file ChatGPT MUST read.
+ChatGPT MUST treat the DUMP file inside the ZIP as the authoritative representation of the codebase.
+All edits MUST be performed by:
+- parsing the DUMP
+- applying changes to the represented files
+- re-generating a new valid DUMP
+- packaging that dump.txt into the OUTPUT ZIP
 
-It defines:
-- format identifier
-- dump version
-- toolchain version
-- ordered list of part files
-- processing instructions
+2.3 Toolchain-enforced packaging (HARD RULE)
 
-Example required fields:
+ChatGPT MUST use the embedded dump scripts as the ONLY authoritative implementation of:
 
-{
-  "format": "chitdump-multipart-v1",
-  "transport": "zip",
-  "version": "vX.Y.Z",
-  "toolchainVersion": "vA.B.C",
-  "parts": [
-    "dump.part_0001.txt",
-    "dump.part_0002.txt"
-  ],
-  "instructions": {
-    "howToUse": [
-      "Unzip the archive",
-      "Read dump.meta.json first",
-      "Process dump parts in listed order",
-      "Each part contains FILE blocks",
-      "Each FILE block is base64 + gzip JSON: { path, content }"
-    ]
-  }
-}
+* dump generation
+* ZIP packaging
+* ZIP validation / unpackaging
 
-ChatGPT MUST follow dump.meta.json exactly.
+In particular:
+
+* The OUTPUT ZIP MUST be the byte-for-byte output of the embedded generator ZIP routine
+  (generateDumpZip / writeDumpZip semantics).
+* The INPUT ZIP MUST be validated and unpacked using the embedded apply/validator ZIP routines
+  (applyDumpZip / validateZipDump semantics).
+* ChatGPT MUST NOT hand-roll or “approximate” ZIP structure, CRCs, headers, etc.
+  The embedded scripts define the canonical format.
 
 ============================================================
-4) DUMP PART FORMAT
+3) OUTPUT RULE (WHAT YOU MUST RETURN)
 ============================================================
+When I request a multi-file change:
 
-Each dump.part_XXXX.txt contains one or more FILE blocks.
+- Output ONLY a downloadable file named: dump_vA.B.C.zip
+- Do NOT paste the full dump contents inline in chat.
+- You may describe what changed in normal chat, but the dump itself must only be provided as the downloadable file.
 
-FILE blocks are delimited by the exact line:
+The OUTPUT ZIP MUST contain EXACTLY ONE file:
 
-  ---FILE---
-
-Each FILE block is:
-- base64 encoded
-- gzip compressed
-- JSON with the structure:
-
-{
-  "path": "<relative/path/within/project>",
-  "content": "<full file contents>"
-}
-
-ChatGPT MUST:
-- Decode base64
-- Gunzip
-- Parse JSON
-- Reconstruct files exactly at the specified paths
+* dump.txt
 
 ============================================================
-5) USER TRIGGER PHRASE
+4) ANTI-ECHO GUARANTEE (HARD RULE)
 ============================================================
 
-If the user uploads a dump ZIP and says:
+If changes are requested, ChatGPT MUST NOT re-emit the INPUT ZIP unchanged.
 
-  "this is the code"
+Specifically, if any change is requested:
+- The OUTPUT ZIP MUST NOT be byte-identical to the INPUT ZIP.
+- The OUTPUT DUMP MUST NOT be content-identical to the INPUT DUMP.
+- The OUTPUT META sha256 / hash MUST differ from the INPUT META sha256 / hash.
+- Returning a re-packaged input ZIP (even with a new filename) is INVALID.
 
-That instruction is COMPLETE.
+This rule is absolute and overrides any ambiguity about “rezipping” or “packaging.”
 
-ChatGPT MUST:
-- Unzip the archive conceptually
-- Load dump.meta.json
-- Reconstruct the full codebase
-- Proceed without asking questions
+4.1 Code-change requirement (HARD RULE)
 
-ChatGPT MUST NOT request clarification.
+If ChatGPT outputs a new ZIP (i.e. not a no-op), it MUST include a real codebase change.
+Meta-only changes do NOT count.
 
-============================================================
-6) CHANGE REQUEST HANDLING
-============================================================
+Specifically:
 
-When the user requests changes to the code:
-
-- ChatGPT MUST base all changes solely on the reconstructed dump
-- ChatGPT MUST NOT invent, omit, or assume files
-- ChatGPT MUST explain changes in plain language
+* At least one repo file's content (inside dump.txt) MUST differ from the INPUT dump.txt.
+* Bumping version / timestamps / meta fields without changing any repo file content is INVALID.
+* If the request produces no repo file changes, ChatGPT MUST NOT create a new ZIP.
+  It MUST report the request as a no-op.
 
 ============================================================
-7) RETURN ARTIFACT ENFORCEMENT (MANDATORY)
+5) VERSIONING RULES (HARD RULES)
 ============================================================
 
-When ChatGPT returns a FULL CODEBASE, SNAPSHOT, or UPDATED DUMP:
+5.1 Mandatory version bump on any change
 
-- ChatGPT MUST return the result ONLY as a ZIP archive
-- ChatGPT MUST NOT inline multiple files in chat
-- ChatGPT MUST NOT return unzipped directories
-- ChatGPT MUST NOT return partial dumps
+If changes are requested (even purely visual, comments, formatting, etc.):
+- The OUTPUT version MUST be strictly greater than the INPUT version.
 
-The ZIP MUST:
-- Be named using the pattern:
+Example:
+- Input:  dump_v0.2.0.zip
+- Output: dump_v0.2.1.zip (or higher)
 
-    dump_vX.Y.Z.zip
+5.2 Output naming
 
-- Contain a valid chitdump multipart structure
-- Include dump.meta.json and all referenced parts
+The OUTPUT ZIP filename MUST match the OUTPUT dump version:
 
-If ChatGPT cannot return a ZIP, it MUST refuse to answer
-and state that ZIP return is required by contract.
+  dump_vA.B.C.zip
 
-============================================================
-8) ZIP RETURN SELF-CHECK (REQUIRED)
-============================================================
+The embedded generator CLI enforces this via:
+  node dump-generate.js --version=vA.B.C
 
-Before responding, ChatGPT MUST internally check:
-
-- Is this a full codebase or snapshot?
-- Does this involve more than one file?
-- Is this larger than a trivial patch?
-
-If YES to any:
-→ The response MUST be a ZIP archive.
-
-If ChatGPT detects it is about to return multiple files
-without zipping them, it MUST STOP and correct itself.
+ChatGPT MUST use that CLI semantics to determine output versioning.
 
 ============================================================
-9) SMALL RESPONSES EXCEPTION
+6) APPLY/PARSE SEMANTICS (HOW dump IS CONSUMED)
 ============================================================
 
-ZIP enforcement does NOT apply when:
+When applying a dump:
 
-- Returning a single small snippet
-- Explaining logic without returning files
-- Providing guidance only
+A) Toolchain self-consistency
+- The embedded toolchain scripts are authoritative.
+- Applying a dump MUST use the embedded apply/validator routines for ZIP validation and extraction.
 
-In these cases, inline text is allowed.
-
-============================================================
-10) BACKWARD COMPATIBILITY
-============================================================
-
-If an older (non-ZIP) dump format is uploaded:
-
-- ChatGPT MAY attempt to process it
-- BUT MUST warn that ZIP multipart dumps are now required
+B) Refactors / deletions must be handled
+- Track the manifest/state of the last applied dump (e.g., .repo_state.json).
+- The active version MUST be updated after apply so the next generate can enforce version bump.
 
 ============================================================
-11) FAILURE CONDITIONS
+7) OPERATOR QUICKSTART (CLI INTENT)
 ============================================================
 
-ChatGPT MUST refuse to proceed if:
+Assume a Node.js CLI exists (or will exist) with these commands:
 
-- dump.meta.json is missing
-- dump.meta.json is invalid JSON
-- referenced dump.part files are missing
-- ZIP structure is incorrect
-- The user requests a full return without allowing ZIP output
+- npm run dump:generate -- --version=vX.Y.Z
+  - writes versions/dump_vX.Y.Z.zip
+  - ZIP contains ONLY dump.txt
+  - dump.txt embeds META with version/toolchainVersion/etc.
 
-============================================================
-12) FINAL RULE
-============================================================
+- npm run dump:apply -- versions/dump_vX.Y.Z.zip
+  - validates ZIP (single dump.txt)
+  - applies dump.txt
+  - updates .repo_state.json active version
 
-Any full-code operation:
-→ ZIP IN
-→ ZIP OUT
-→ No exceptions
-
-============================================================
-END OF CONTRACT
-============================================================
+End of contract.

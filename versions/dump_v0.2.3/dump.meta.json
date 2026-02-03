@@ -1,0 +1,26 @@
+{
+  "format": "chitdump-multipart-v1",
+  "transport": "zip",
+  "version": "v0.2.3",
+  "toolchainVersion": "v1.2.0",
+  "createdAt": 1770078178968,
+  "instructions": {
+    "howToUse": [
+      "Unzip the archive",
+      "Read dump.meta.json first",
+      "Apply dump parts in listed order",
+      "Each dump.part_XXXX.txt contains FILE blocks",
+      "Each FILE block is base64 + gzip JSON: { path, content }"
+    ]
+  },
+  "parts": [
+    "dump.part_0001.txt",
+    "dump.part_0002.txt",
+    "dump.part_0003.txt",
+    "dump.part_0004.txt",
+    "dump.part_0005.txt",
+    "dump.part_0006.txt",
+    "dump.part_0007.txt",
+    "dump.part_0008.txt"
+  ]
+}

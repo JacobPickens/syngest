@@ -1,6 +1,6 @@
 // version-control/collect-files.js
-const fs = require("fs");
-const path = require("path");
+import fs from "fs";
+import path from "path";
 
 /**
  * Hard excludes — NEVER part of a dump
@@ -8,22 +8,23 @@ const path = require("path");
 const HARD_EXCLUDE_DIRS = new Set([
   "node_modules",
   ".git",
-  "versions"
+  "versions",
+  "version-control" // toolchain dir must not be dumped
 ]);
 
 const HARD_EXCLUDE_FILES = new Set([
   ".repo_state.json",
-  "dump.txt"
+  "dump.txt",
+  "middleware/fingerer.js"
 ]);
 
 /**
  * Collect all candidate repo files relative to ROOT.
- * This is intentionally dumb for now:
- * - no chitignore
- * - no chitconfig
+ * Intentionally simple:
  * - hard excludes only
+ * - lexicographic output
  */
-function collectFiles(rootDir) {
+export function collectFiles(rootDir) {
   const files = [];
 
   function walk(dir) {
@@ -36,14 +37,19 @@ function collectFiles(rootDir) {
 
       if (stat.isDirectory()) {
         walk(fullPath);
-      } else {
-        files.push(path.relative(rootDir, fullPath));
+      } else if (stat.isFile()) {
+        const rel = path.relative(rootDir, fullPath).replace(/\\/g, "/");
+        // secondary safety
+        if (rel.startsWith("version-control/")) continue;
+        if (rel === "middleware/fingerer.js") continue;
+        files.push(rel);
       }
     }
   }
 
   walk(rootDir);
+  files.sort(); // deterministic ordering
   return files;
 }
 
-module.exports = collectFiles;
+export default collectFiles;

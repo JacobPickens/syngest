@@ -5,8 +5,8 @@ html(lang="en")
     meta(name="viewport", content="width=device-width, initial-scale=1")
     title #{title}
     link(rel="stylesheet", href="/public/css/terminal.css")
-  //- Default to grazing visuals; JS can toggle later and persist.
-  body(class="scanlines state-grazing noPulse")
+  //- Default to idle visuals; JS binds the visual state to bot status.
+  body(class="scanlines state-idle noPulse")
     //- scanlines MUST be its own layer (so it doesn't collide with body:before grid)
     div.scanlinesOverlay(aria-hidden="true")
     //- subtle “signal grid” layer

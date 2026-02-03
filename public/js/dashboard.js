@@ -39,8 +39,12 @@
 
   /* -------------------- state toggle -------------------- */
 
-  const STATE_KEY = 'syngest_ui_state';
-
+  /**
+   * Visual state is derived from bot status:
+   * - idle   = not running AND not armed
+   * - grazing = otherwise
+   * - ingesting is reserved (unused)
+   */
   function setUiState(next) {
     const body = document.body;
 
@@ -70,14 +74,16 @@
         'GRAZING';
     }
 
-    try { localStorage.setItem(STATE_KEY, next); } catch {}
   }
 
-  function initUiState() {
-    let v = null;
-    try { v = localStorage.getItem(STATE_KEY); } catch {}
-    if (v !== 'idle' && v !== 'grazing' && v !== 'ingesting') v = 'grazing';
-    setUiState(v);
+  function deriveUiStateFromBot(st) {
+    const armed = !!(st && st.armed);
+    const running = !!(st && st.running);
+    return (!armed && !running) ? 'idle' : 'grazing';
+  }
+
+  function syncUiStateToBot(st) {
+    setUiState(deriveUiStateFromBot(st));
   }
 
   /* -------------------- header + pills -------------------- */
@@ -363,6 +369,9 @@
       if (st.running) controls.classList.add('isRunning');
       else controls.classList.remove('isRunning');
     }
+
+    // bind page theme/state to bot status
+    syncUiStateToBot(st);
   }
 
   async function fetchSchedule(reset) {
@@ -500,18 +509,13 @@
   /* -------------------- init -------------------- */
 
   function init() {
-    initUiState();
+    // Starting state is always idle until we observe bot status.
+    setUiState('idle');
 
     // remove noPulse once JS is live (prevents initial flash animation)
     document.body.classList.remove('noPulse');
 
-    // toggle wiring
-    el('stateIdleBtn')?.addEventListener('click', () => setUiState('idle'));
-    el('stateGrazingBtn')?.addEventListener('click', () => setUiState('grazing'));
-    el('stateIngestBtn')?.addEventListener('click', () => setUiState('ingesting'));
-
-    // “INGEST” button is a UI preview: toggles ingesting state (no backend behavior)
-    document.querySelector('.btnEnergy')?.addEventListener('click', () => setUiState('ingesting'));
+    // State buttons are display-only (disabled in markup).
 
     // action button styling classes
     applyActionButtonClasses();

@@ -347,6 +347,12 @@ body.fuzzOn .fuzzOverlay { opacity: .45; }
   cursor: pointer;
 }
 
+.stateBtn[disabled],
+.stateBtn[aria-disabled="true"] {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
 .stateBtn.active {
   color: var(--text);
   border-color: color-mix(in srgb, var(--accent-a) 55%, transparent);

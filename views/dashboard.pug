@@ -7,7 +7,7 @@ block content
         .mark(aria-hidden="true")
         .word SYNGEST
         .stateTag
-          span#uiStateLabel GRAZING
+          span#uiStateLabel IDLE
           span.dots ...
       .topMeta
         .facts
@@ -21,9 +21,10 @@ block content
             span.k First hit
             span.v#hFirstEver —
         .toggle
-          button.stateBtn#stateIdleBtn(type="button" title="Idle") IDLE
-          button.stateBtn.active#stateGrazingBtn(type="button" title="Grazing") GRAZING
-          button.stateBtn#stateIngestBtn(type="button" title="Ingesting") INGESTING
+          //- State buttons are display-only; UI state is driven by bot status.
+          button.stateBtn.active#stateIdleBtn(type="button" title="Idle" disabled aria-disabled="true") IDLE
+          button.stateBtn#stateGrazingBtn(type="button" title="Grazing" disabled aria-disabled="true") GRAZING
+          button.stateBtn#stateIngestBtn(type="button" title="Ingesting" disabled aria-disabled="true") INGESTING
         .tagRow
           span.tag RUN:
           span.mono#activeRunTag —
@@ -74,8 +75,7 @@ block content
               .h
                 span.title Feed rate
                 span.sub / minute
-              .right
-                button.btnEnergy(type="button" title="Ingest") INGEST
+              //- Ingest state is currently unused; remove manual toggles.
             .panelBody
               .feedTop
                 .feedVal

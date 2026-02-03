@@ -1,0 +1,9 @@
+{
+  "name": "chit-dumps-toolchain",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dump:generate": "node ./dump-generate.js",
+    "dump:apply": "node ./dump-apply.js"
+  }
+}
