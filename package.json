@@ -5,7 +5,7 @@
   "description": "Non-interfering Express + Pug scan dashboard that polls SQLite and a log file.",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
+    "start": "node src/server.js",
     "dump:generate": "node ./version-control/dump-generate.js",
     "dump:apply": "node ./version-control/dump-apply.js",
     "dump:active": "node ./version-control/print-active.js",

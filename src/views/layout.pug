@@ -1,0 +1,20 @@
+doctype html
+html(lang="en")
+  head
+    meta(charset="utf-8")
+    meta(name="viewport", content="width=device-width, initial-scale=1")
+    title #{title}
+    link(rel="stylesheet", href="/public/css/terminal.css")
+  //- Default to idle visuals; JS binds the visual state to bot status.
+  body(class="scanlines state-idle noPulse")
+    //- scanlines MUST be its own layer (so it doesn't collide with star/glow effects)
+    div.scanlinesOverlay(aria-hidden="true")
+    //- constellation clusters (static stars + glow)
+    div.constellations(aria-hidden="true")
+    //- procedural background: shooting stars + comets (state-aware)
+    div.shootingStars(aria-hidden="true")
+    //- rare “connection loss fuzz” overlay (toggled by JS)
+    div.fuzzOverlay(aria-hidden="true")
+    block content
+    script(src="/public/js/dashboard.js" defer)
+    script(src="/public/js/fx.js" defer)

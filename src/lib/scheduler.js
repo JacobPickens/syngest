@@ -8,14 +8,33 @@ const { spawn } = require('child_process');
 const runOutput = require('./run-output');
 const { writeEnvKey } = require('./envfile');
 
-const STATE_PATH = process.env.SCHED_STATE_PATH || path.resolve('./scheduleState.json');
+// __dirname is: <project>/src/lib
+// All runtime artifacts should live in <project>/bin
+const PROJECT_ROOT = path.resolve(__dirname, '..', '..');
+const STATE_PATH = process.env.SCHED_STATE_PATH
+  ? (path.isAbsolute(process.env.SCHED_STATE_PATH)
+      ? process.env.SCHED_STATE_PATH
+      : path.resolve(PROJECT_ROOT, process.env.SCHED_STATE_PATH))
+  : path.join(PROJECT_ROOT, 'bin', 'scheduleState.json');
 
-const DEFAULT_SCAN_CMD = process.env.SCAN_CMD || 'node safe_scan.js';
+// Default to the new src/ structure.
+const DEFAULT_SCAN_CMD = process.env.SCAN_CMD || 'node src/scripts/safe_scan.js';
 
 const LOOP_MS = Number(process.env.SCHED_LOOP_MS || 500);
 
 let loopTimer = null;
 let runningChild = null;
+
+function makeRunId() {
+  const d = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  const stamp =
+    `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}_` +
+    `${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+  const rand = require('crypto').randomBytes(3).toString('hex');
+  return `run_${stamp}_${rand}`;
+}
+
 
 function defaultState() {
   return {
@@ -108,7 +127,9 @@ function startBackgroundLoop(scanCmd = DEFAULT_SCAN_CMD) {
     writeState({ ...s, running: true, lastExit: null });
 
     // new run clears output + marks state
-    runOutput.beginRun({ source: 'scheduler', cmd: scanCmd });
+    const runId = makeRunId();
+    const initiatedBy = s.startedByDashboard ? 'user' : 'scheduler';
+    runOutput.beginRun({ source: 'scheduler', cmd: scanCmd, runId, initiatedBy });
 
     // IMPORTANT: don't pipe stdout into dashboard (zmap uses stdout for results).
     // safe_scan.js should write to runOutput.txt itself.
@@ -119,7 +140,8 @@ function startBackgroundLoop(scanCmd = DEFAULT_SCAN_CMD) {
     //   without introducing a hard dependency on bash.
     runningChild = spawn(scanCmd, {
       shell: true,
-      stdio: ['ignore', 'ignore', 'pipe']
+      stdio: ['ignore', 'ignore', 'pipe'],
+      env: { ...process.env, RUN_ID: runId, RUN_INITIATED_BY: initiatedBy }
     });
 
     runningChild.stderr.on('data', (d) => {

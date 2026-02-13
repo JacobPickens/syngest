@@ -1,17 +1,15 @@
 // --- src/routes/dashboard.js ---
-// Express router for the dashboard UI + API.
+// Dashboard UI + API.
 //
-// This router is wired to the rest of the project:
-// - Scheduler state + run spawning is handled by src/lib/scheduler.js
-// - Run console output + tailing is handled by src/lib/run-output.js
-// - Run metadata + rows are read from the project's SQLite DB (default: ./online.sqlite)
-//
-// NOTE: DB access is best-effort and supports either `better-sqlite3` (sync) or `sqlite3` (async)
-// if either dependency is installed.
+// Schema summary:
+// - runs(run_id, started_at, ended_at, initiated_by, status, blocks_scanned, ips_found)
+// - run_blocks(run_id, ip_block, picked_at, ip_block_namespace, ip_block_file)
+// - ips(run_id, ip, port, source, first_seen, last_seen, seen_count)
 
 'use strict';
 
 const path = require('path');
+const fs = require('fs');
 const express = require('express');
 
 const scheduler = require('../lib/scheduler');
@@ -26,12 +24,17 @@ const router = express.Router();
 // __dirname is: <project>/src/routes
 const PROJECT_ROOT = path.resolve(__dirname, '..', '..');
 
-const DEFAULT_DB_PATH = path.join(PROJECT_ROOT, 'online.sqlite');
+const DEFAULT_DB_PATH = path.join(PROJECT_ROOT, 'db', 'online.sqlite');
 
 // allow override via env; accept absolute or project-root relative
 const DB_PATH = process.env.DB_PATH
   ? (path.isAbsolute(process.env.DB_PATH) ? process.env.DB_PATH : path.resolve(PROJECT_ROOT, process.env.DB_PATH))
   : DEFAULT_DB_PATH;
+
+// Ensure the DB directory exists before we try to open it.
+try {
+  fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+} catch (_) {}
 
 // For display only (tailing uses runOutput.OUTPUT_TXT_PATH)
 const OUTPUT_PATH = runOutput.OUTPUT_TXT_PATH;
@@ -43,16 +46,112 @@ const OUTPUT_PATH = runOutput.OUTPUT_TXT_PATH;
 let sqlite = null;
 let db = null;
 
+
+// Seed allowed_blocks from bin/allowed_blocks.txt if the DB table is empty.
+// (DB is source of truth at runtime; the file is just a bootstrap.)
+function seedAllowedBlocksIfEmpty(dbc, sqliteKind, projectRoot) {
+  try {
+    const blocksFile = path.join(projectRoot, 'bin', 'allowed_blocks.txt');
+    if (!fs.existsSync(blocksFile)) return;
+    const lines = fs.readFileSync(blocksFile, 'utf8')
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean);
+    if (!lines.length) return;
+
+    const now = Math.floor(Date.now() / 1000);
+
+    if (sqliteKind === 'better-sqlite3') {
+      const n = dbc.prepare('SELECT COUNT(1) AS n FROM allowed_blocks').get() || { n: 0 };
+      if (Number(n.n || 0) > 0) return;
+      const ins = dbc.prepare('INSERT OR IGNORE INTO allowed_blocks(ip_block, added_at, enabled) VALUES(?,?,1)');
+      const tx = dbc.transaction((rows) => { for (const b of rows) ins.run(b, now); });
+      tx(lines);
+      return;
+    }
+
+    // sqlite3: best-effort async seeding
+    dbc.get('SELECT COUNT(1) AS n FROM allowed_blocks', [], (err, row) => {
+      if (err) return;
+      if (Number(row?.n || 0) > 0) return;
+      const stmt = dbc.prepare('INSERT OR IGNORE INTO allowed_blocks(ip_block, added_at, enabled) VALUES(?,?,1)');
+      for (const b of lines) stmt.run(b, now);
+      stmt.finalize?.();
+    });
+  } catch (_) {
+    // ignore
+  }
+}
+
+
 // Support either better-sqlite3 or sqlite3 if installed.
 function tryInitDb() {
   if (db) return db;
+
+  const initSchemaSql = `
+    CREATE TABLE IF NOT EXISTS runs (
+      run_id TEXT PRIMARY KEY,
+      started_at INTEGER NOT NULL,
+      ended_at INTEGER,
+      initiated_by TEXT NOT NULL DEFAULT 'unknown',
+      status TEXT NOT NULL DEFAULT 'running', -- running|completed|failed
+      blocks_scanned INTEGER NOT NULL DEFAULT 0,
+      ips_found INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS run_blocks (
+      run_id TEXT NOT NULL,
+      ip_block TEXT NOT NULL,
+      picked_at INTEGER NOT NULL,
+      ip_block_namespace TEXT NOT NULL,
+      ip_block_file TEXT NOT NULL,
+      PRIMARY KEY (run_id, ip_block, picked_at)
+    );
+
+    CREATE TABLE IF NOT EXISTS ips (
+      run_id TEXT NOT NULL,
+      ip TEXT NOT NULL,
+      port INTEGER NOT NULL,
+      source TEXT NOT NULL,
+      first_seen INTEGER NOT NULL,
+      last_seen INTEGER NOT NULL,
+      seen_count INTEGER NOT NULL,
+      PRIMARY KEY (run_id, ip, port, source)
+    );
+
+    CREATE TABLE IF NOT EXISTS block_ips (
+      run_id TEXT NOT NULL,
+      ip_block TEXT NOT NULL,
+      ip TEXT NOT NULL,
+      port INTEGER NOT NULL,
+      source TEXT NOT NULL,
+      first_seen INTEGER NOT NULL,
+      last_seen INTEGER NOT NULL,
+      seen_count INTEGER NOT NULL,
+      PRIMARY KEY (run_id, ip_block, ip, port, source)
+    );
+
+    CREATE TABLE IF NOT EXISTS allowed_blocks (
+      ip_block TEXT PRIMARY KEY,
+      added_at INTEGER NOT NULL,
+      enabled INTEGER NOT NULL DEFAULT 1
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_ips_ip ON ips(ip);
+    CREATE INDEX IF NOT EXISTS idx_block_ips_block ON block_ips(ip_block);
+    CREATE INDEX IF NOT EXISTS idx_block_ips_last_seen ON block_ips(last_seen);
+    CREATE INDEX IF NOT EXISTS idx_ips_last_seen ON ips(last_seen);
+    CREATE INDEX IF NOT EXISTS idx_runs_started_at ON runs(started_at);
+  `;
 
   // better-sqlite3 (sync)
   try {
     // eslint-disable-next-line import/no-extraneous-dependencies
     const BetterSqlite3 = require('better-sqlite3');
     sqlite = { kind: 'better-sqlite3' };
-    db = new BetterSqlite3(DB_PATH, { readonly: true });
+    db = new BetterSqlite3(DB_PATH);
+    db.exec(initSchemaSql);
+    seedAllowedBlocksIfEmpty(db, sqlite.kind, PROJECT_ROOT);
     return db;
   } catch (_) {}
 
@@ -61,12 +160,17 @@ function tryInitDb() {
     // eslint-disable-next-line import/no-extraneous-dependencies
     const sqlite3 = require('sqlite3');
     sqlite = { kind: 'sqlite3', sqlite3 };
-    db = new sqlite3.Database(DB_PATH, sqlite3.OPEN_READONLY);
-    return db;
+    db = new sqlite3.Database(DB_PATH, sqlite3.OPEN_READWRITE | sqlite3.OPEN_CREATE);
+    db.serialize();
+    db.exec(initSchemaSql);
+    seedAllowedBlocksIfEmpty(db, sqlite.kind, PROJECT_ROOT);
+    return db
   } catch (_) {}
 
   return null;
 }
+
+try { tryInitDb(); } catch (_) {}
 
 function dbAll(sql, params = []) {
   const dbc = tryInitDb();
@@ -75,8 +179,7 @@ function dbAll(sql, params = []) {
   if (sqlite.kind === 'better-sqlite3') {
     try {
       const stmt = dbc.prepare(sql);
-      const rows = stmt.all(params);
-      return Promise.resolve(rows);
+      return Promise.resolve(stmt.all(params));
     } catch (e) {
       return Promise.reject(e);
     }
@@ -94,8 +197,7 @@ function dbGet(sql, params = []) {
   if (sqlite.kind === 'better-sqlite3') {
     try {
       const stmt = dbc.prepare(sql);
-      const row = stmt.get(params);
-      return Promise.resolve(row);
+      return Promise.resolve(stmt.get(params));
     } catch (e) {
       return Promise.reject(e);
     }
@@ -110,11 +212,10 @@ function clamp(n, a, b) {
   return Math.max(a, Math.min(b, n));
 }
 
-function safeTableName(input) {
+function safeRunId(input) {
   const s = String(input || '');
-  // allow run_YYYYMMDD_HHMMSS_xxxxxx
-  const cleaned = s.replace(/[^a-zA-Z0-9_]/g, '');
-  return cleaned;
+  // allow simple ids like run_YYYY..._hex
+  return s.replace(/[^a-zA-Z0-9_]/g, '');
 }
 
 // ---------------------------
@@ -133,8 +234,6 @@ router.get(['/', '/dashboard'], (req, res) => {
 // ---------------------------
 // Tail endpoint (live console)
 // ---------------------------
-//
-// Client expects: { text, source, running, ... }
 
 router.get('/api/tail', (req, res) => {
   const key = String(req.query.key || 'global');
@@ -149,117 +248,141 @@ router.get('/api/tail', (req, res) => {
 });
 
 // ---------------------------
-// Run + DB endpoints
+// Summary / pills
 // ---------------------------
 
-// Expected by client: /api/run/latest -> { meta, block, firstEverCreatedAt }
-router.get('/api/run/latest', async (req, res) => {
+router.get('/api/pills', async (_req, res) => {
   try {
-    // Prefer the most recent run whose per-run table still exists.
-    const meta = await dbGet(
-      `SELECT run_table, created_at, source, port
-       FROM runs_meta
-       WHERE run_table IN (
-         SELECT name FROM sqlite_master WHERE type='table'
-       )
-       ORDER BY created_at DESC
-       LIMIT 1`
+    const st = scheduler.getState();
+    const runState = runOutput.peekState();
+
+    const totalFound = await dbGet(`SELECT COUNT(DISTINCT ip) AS n FROM ips`).catch(() => ({ n: 0 }));
+    const firstHit = await dbGet(`SELECT MIN(first_seen) AS t FROM ips`).catch(() => ({ t: null }));
+    const lastHit = await dbGet(`SELECT MAX(last_seen) AS t FROM ips`).catch(() => ({ t: null }));
+
+    const lastRunRow = await dbGet(
+      `SELECT run_id FROM runs WHERE status='completed' ORDER BY ended_at DESC, started_at DESC LIMIT 1`
     ).catch(() => null);
 
-    const firstEver = await dbGet(
-      `SELECT MIN(created_at) AS first_ever_created_at FROM runs_meta`
-    ).catch(() => null);
+    const lastRunCount = lastRunRow
+      ? await dbGet(`SELECT COUNT(DISTINCT ip) AS n FROM ips WHERE run_id=?`, [lastRunRow.run_id]).catch(() => ({ n: 0 }))
+      : { n: 0 };
 
-    let block = null;
-    if (meta && meta.run_table) {
-      block = await dbGet(
-        `SELECT ip_block, picked_at, ip_block_namespace, ip_block_file
-         FROM run_block
-         WHERE run_table = ?
-         ORDER BY picked_at DESC
-         LIMIT 1`,
-        [meta.run_table]
-      ).catch(() => null);
-    } else {
-      // fallback: latest block overall
-      block = await dbGet(
-        `SELECT ip_block, picked_at, ip_block_namespace, ip_block_file, run_table
-         FROM run_block
-         ORDER BY picked_at DESC
-         LIMIT 1`
-      ).catch(() => null);
+    let thisRun = { running: false, run_id: null, n: 0 };
+    if (runState && runState.running && runState.meta && runState.meta.runId) {
+      const rid = safeRunId(runState.meta.runId);
+      if (rid) {
+        const c = await dbGet(`SELECT COUNT(DISTINCT ip) AS n FROM ips WHERE run_id=?`, [rid]).catch(() => ({ n: 0 }));
+        thisRun = { running: true, run_id: rid, n: c.n || 0 };
+      }
     }
 
     return res.json({
-      meta: meta || null,
-      block: block || null,
-      firstEverCreatedAt: firstEver ? firstEver.first_ever_created_at : null
+      ok: true,
+      totalFound: Number(totalFound.n || 0),
+      lastRun: Number(lastRunCount.n || 0),
+      thisRun,
+      firstHit: firstHit.t ? Number(firstHit.t) : null,
+      lastHit: lastHit.t ? Number(lastHit.t) : null,
+      scheduler: st,
+      runState: runState || null
     });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
+// ---------------------------
+// Allowed blocks summary
+// ---------------------------
 
-// Expected by client: /api/run/:run/stats -> stats object
-router.get('/api/run/:run/stats', async (req, res) => {
-  const run = safeTableName(req.params.run);
-  if (!run) return res.status(400).json({ ok: false, error: 'missing run' });
-
-  try {
-    const base = await dbGet(
-      `SELECT
-         COUNT(DISTINCT ip) AS unique_ips,
-         COUNT(1) AS total_observations,
-         MIN(first_seen) AS first_seen,
-         MAX(last_seen) AS last_seen
-       FROM "${run}"`
-    );
-
-    const nowSec = Math.floor(Date.now() / 1000);
-    const hot = await dbGet(
-      `SELECT COUNT(DISTINCT ip) AS hot_unique_ips
-       FROM "${run}"
-       WHERE last_seen >= ?`,
-      [nowSec - 60]
-    ).catch(() => ({ hot_unique_ips: 0 }));
-
-    return res.json({
-      unique_ips: base?.unique_ips ?? 0,
-      total_observations: base?.total_observations ?? 0,
-      hot_unique_ips: hot?.hot_unique_ips ?? 0,
-      first_seen: base?.first_seen ?? null,
-      last_seen: base?.last_seen ?? null
-    });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
-  }
-});
-
-// Expected by client: /api/run/:run/rows?limit=50 -> array of rows
-router.get('/api/run/:run/rows', async (req, res) => {
-  const run = safeTableName(req.params.run);
-  const limit = clamp(Number(req.query.limit || 50), 1, 500);
-
-  if (!run) return res.status(400).json({ ok: false, error: 'missing run' });
-
+router.get('/api/allowed-blocks', async (_req, res) => {
   try {
     const rows = await dbAll(
-      `SELECT
-         ip,
-         port,
-         source,
-         first_seen,
-         last_seen,
-         seen_count,
-         "${run}" AS _run
-       FROM "${run}"
-       ORDER BY last_seen DESC
+      "SELECT ab.ip_block AS ip_block, ab.enabled AS enabled, ab.added_at AS added_at,\n              COALESCE(rb.times_scanned, 0) AS times_scanned,\n              rb.last_scanned_at AS last_scanned_at,\n              COALESCE(bi.ips_found, 0) AS ips_found\n       FROM allowed_blocks ab\n       LEFT JOIN (\n         SELECT ip_block, COUNT(1) AS times_scanned, MAX(picked_at) AS last_scanned_at\n         FROM run_blocks\n         GROUP BY ip_block\n       ) rb ON rb.ip_block = ab.ip_block\n       LEFT JOIN (\n         SELECT ip_block, COUNT(DISTINCT ip) AS ips_found\n         FROM block_ips\n         GROUP BY ip_block\n       ) bi ON bi.ip_block = ab.ip_block\n       WHERE ab.enabled = 1\n       ORDER BY (rb.last_scanned_at IS NULL) ASC, rb.last_scanned_at DESC, ab.added_at DESC"
+    );
+
+    const totals = rows.reduce((acc, r) => {
+      acc.blocks += 1;
+      acc.scans += Number(r.times_scanned || 0);
+      acc.ips += Number(r.ips_found || 0);
+      return acc;
+    }, { blocks: 0, scans: 0, ips: 0 });
+
+    return res.json({ ok: true, rows: rows.map((r) => ({
+      ip_block: r.ip_block,
+      times_scanned: Number(r.times_scanned || 0),
+      last_scanned_at: r.last_scanned_at ? Number(r.last_scanned_at) : null,
+      ips_found: Number(r.ips_found || 0),
+      scanned_before: Number(r.times_scanned || 0) > 0
+    })), totals });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+// ---------------------------
+// Runs
+// ---------------------------
+
+router.get('/api/runs', async (req, res) => {
+  const limit = clamp(Number(req.query.limit || 20), 1, 200);
+  try {
+    const rows = await dbAll(
+      `SELECT run_id, started_at, ended_at, initiated_by, status, blocks_scanned, ips_found
+       FROM runs
+       ORDER BY started_at DESC
        LIMIT ?`,
       [limit]
     ).catch(() => []);
-
     return res.json(Array.isArray(rows) ? rows : []);
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+router.get('/api/runs/:runId/ips', async (req, res) => {
+  const runId = safeRunId(req.params.runId);
+  const limit = clamp(Number(req.query.limit || 500), 1, 5000);
+  if (!runId) return res.status(400).json({ ok: false, error: 'missing run id' });
+
+  try {
+    const rows = await dbAll(
+      `SELECT ip, port, source, first_seen, last_seen, seen_count
+       FROM ips
+       WHERE run_id=?
+       ORDER BY last_seen DESC
+       LIMIT ?`,
+      [runId, limit]
+    ).catch(() => []);
+    return res.json(Array.isArray(rows) ? rows : []);
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+router.get('/api/run/latest', async (_req, res) => {
+  try {
+    const meta = await dbGet(
+      `SELECT run_id, started_at, ended_at, initiated_by, status, blocks_scanned, ips_found
+       FROM runs
+       ORDER BY started_at DESC
+       LIMIT 1`
+    ).catch(() => null);
+
+    let block = null;
+    if (meta && meta.run_id) {
+      block = await dbGet(
+        `SELECT ip_block, picked_at, ip_block_namespace, ip_block_file
+         FROM run_blocks
+         WHERE run_id=?
+         ORDER BY picked_at DESC
+         LIMIT 1`,
+        [meta.run_id]
+      ).catch(() => null);
+    }
+
+    return res.json({ meta, block });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
@@ -271,21 +394,14 @@ router.get('/api/run/:run/rows', async (req, res) => {
 
 router.get('/api/blocks/recent', async (req, res) => {
   const limit = clamp(Number(req.query.limit || 8), 1, 50);
-
   try {
     const rows = await dbAll(
-      `SELECT
-         ip_block,
-         picked_at,
-         run_table,
-         ip_block_namespace,
-         ip_block_file
-       FROM run_block
+      `SELECT ip_block, picked_at, run_id, ip_block_namespace, ip_block_file
+       FROM run_blocks
        ORDER BY picked_at DESC
        LIMIT ?`,
       [limit]
     ).catch(() => []);
-
     return res.json(Array.isArray(rows) ? rows : []);
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
@@ -293,43 +409,35 @@ router.get('/api/blocks/recent', async (req, res) => {
 });
 
 // ---------------------------
-// Scheduler endpoints (persisted state)
+// Scheduler endpoints
 // ---------------------------
 
-// Client expects: /api/schedule/status -> { armed, delaySec, nextRunAtMs, running, ... }
 router.get('/api/schedule/status', (req, res) => {
   res.json(scheduler.getState());
 });
 
-// POST { delaySec }
 router.post('/api/schedule/arm', express.json(), (req, res) => {
   const delaySec = Number(req.body && req.body.delaySec);
-
   if (!Number.isFinite(delaySec) || delaySec < 1) {
     return res.status(400).json({ ok: false, error: 'delaySec must be >= 1' });
   }
-
   const out = scheduler.arm(delaySec, 'dashboard');
   return res.json(out.state);
 });
 
-// POST (no body)
 router.post('/api/schedule/disarm', (req, res) => {
   const out = scheduler.cancel('dashboard');
   return res.json(out.state);
 });
 
-// Alias for older UIs that send “cancel”
 router.post('/api/schedule/cancel', (req, res) => {
   const out = scheduler.cancel('dashboard');
   return res.json(out.state);
 });
 
-// POST (no body)
 router.post('/api/schedule/run-now', (req, res) => {
   const out = scheduler.runNow('dashboard');
   return res.json(out.state);
 });
 
 module.exports = router;
-

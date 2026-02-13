@@ -1,0 +1,9 @@
+extends layout
+
+block content
+  main(style="padding:18px")
+    h1(style="font-family: var(--mono); margin: 0 0 10px") #{title}
+    p(style="font-family: var(--mono); color: var(--muted)") #{message}
+    if status
+      p(style="font-family: var(--mono); color: var(--muted)") status=#{status}
+

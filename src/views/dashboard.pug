@@ -1,0 +1,208 @@
+extends layout
+
+block content
+  main.dash
+    header.topbar
+      .brand
+        img.logo(src="public/img/logo-cropped.png")
+        .stateTag
+          span#uiStateLabel IDLE
+          span.dots ...
+      .topMeta
+        .facts
+          .fact
+            span.k Last block
+            span.v#hLastBlock —
+          .fact
+            span.k Last graze
+            span.v#hLastTime —
+          .fact
+            span.k First hit
+            span.v#hFirstEver —
+        .toggle
+          //- State buttons are display-only; UI state is driven by bot status.
+          button.stateBtn.active#stateIdleBtn(type="button" title="Idle" disabled aria-disabled="true") IDLE
+          button.stateBtn#stateGrazingBtn(type="button" title="Grazing" disabled aria-disabled="true") GRAZING
+          button.stateBtn#stateIngestBtn(type="button" title="Ingesting" disabled aria-disabled="true") INGESTING
+        .fx
+          button.fxBtn#fxToggleBtn(type="button" title="Toggle visual effects") FX: ON
+
+        .tagRow
+          span.tag RUN:
+          span.mono#activeRunTag —
+          span.sep ·
+          span.tag DB:
+          span.mono #{cfg.dbPath}
+          span.sep ·
+          span.tag OUTPUT:
+          span.mono #{cfg.outputPath}
+
+    section.pills
+      .pill#pillTotalFound
+        span.label TOTAL FOUND
+        span.value#pTotalFound 0
+      .pill#pillLastRun
+        span.label LAST RUN
+        span.value#pLastRun 0
+      .pill#pillThisRun
+        span.label THIS RUN
+        span.value#pThisRun Not Running
+      .pill#pillFirst
+        span.label FIRST HIT
+        span.value#pFirst —
+      .pill#pillLast
+        span.label LAST HIT
+        span.value#pLast —
+
+    section.grid
+      //- Left rail (visual only)
+      nav.rail(aria-label="Navigation")
+        button.railBtn(type="button" aria-label="Overview")
+          span.ico ⌂
+        button.railBtn(type="button" aria-label="Sources")
+          span.ico ◎
+        button.railBtn(type="button" aria-label="Logs")
+          span.ico ≋
+        button.railBtn(type="button" aria-label="Search")
+          span.ico ⌕
+        .railSep
+        button.railBtn(type="button" aria-label="Settings")
+          span.ico ⚙
+
+      //- Main content column
+      .col
+        .row
+          .panel.feed
+            .panelHead
+              .h
+                span.title Feed rate
+                span.sub / minute
+              //- Ingest state is currently unused; remove manual toggles.
+            .panelBody
+              .feedTop
+                .feedVal
+                  span.big#feedRateVal —
+                  span.unit hits/min
+                .miniMeta
+                  div
+                    span.k PORT
+                    span.v.mono#mPort —
+                  div
+                    span.k SOURCE
+                    span.v.mono#mSource —
+              canvas#feedChart(width="560" height="160" aria-label="Feed rate chart")
+          .stack.topStack
+            .panel.controls
+              .panelHead
+                .h
+                  span.title Grazer controls
+                  span.sub scheduling + run
+                .right
+                  span.chip#schedState —
+              .panelBody
+                form#schedForm
+                  .fieldRow
+                    label(for="delayMin") Intake cycle (minutes)
+                    input#delayMin(type="number" min="1" step="1" value="15")
+                  .btnRow
+                    button#armBtn(type="submit") Arm
+                    button#disarmBtn(type="button") Disarm
+                    button#runNowBtn(type="button") Graze now
+                  .nextRow
+                    span.k Next graze
+                    span.v.mono#countdown —
+                  .note
+                    span.k Run
+                    span.v.mono#mRun —
+                    span.sep ·
+                    span.k Created
+                    span.v.mono#mCreated —
+                    span.sep ·
+                    span.k Block
+                    span.v.mono#mBlock —
+            .panel.terminal
+              .panelHead
+                .h
+                  span.title Terminal
+                  span.sub run output
+                .right
+                  span.tag TAIL:
+                  span.mono#tailTag —
+                  span.sep ·
+                  span.tag UPDATED:
+                  span.mono#lastUpdateTag —
+              .panelBody
+                pre.console#console
+
+
+        .row
+          .panel.hits
+            .panelHead
+              .h
+                span.title Runs
+                span.sub history + details
+              .right
+                .tabRow
+                  button.tabBtn.active#tabRunsBtn(type="button") Runs
+                  button.tabBtn#tabDetailsBtn(type="button") Run details
+                span.chip#rowsTag —
+            .panelBody
+              .runsView#runsView
+                .tableWrap.scrollY
+                  table.table
+                    thead
+                      tr
+                        th Run
+                        th Started
+                        th Blocks
+                        th IPs
+                        th By
+                        th Status
+                    tbody#runsBody
+                      tr
+                        td(colspan="6").muted waiting…
+              .detailsView#detailsView(style="display:none")
+                .detailsEmpty#detailsEmpty.muted Must have completed a graze first.
+                .tableWrap.scrollY#detailsTableWrap(style="display:none")
+                  table.table
+                    thead
+                      tr
+                        th IP
+                        th Port
+                        th Source
+                        th First hit
+                        th Last hit
+                        th Seen
+                    tbody#detailsBody
+                      tr
+                        td(colspan="6").muted waiting…
+
+
+          .panel.allowedBlocks
+            .panelHead
+              .h
+                span.title Allowed Blocks
+                span.sub scan history by block
+              .right
+                span.chip#allowedTag —
+            .panelBody
+              .tableWrap.scrollY
+                table.table
+                  thead
+                    tr
+                      th Block
+                      th Last scanned
+                      th Scans
+                      th IPs
+                  tbody#allowedBlocksBody
+                    tr
+                      td(colspan="4").muted waiting…
+              .note.compact
+                span.k Blocks
+                span.v.mono#allowedBlocksCount —
+                span.sep ·
+                span.k Scans
+                span.v.mono#allowedBlocksScans —
+                span.sep ·
+                span.k IPs
+                span.v.mono#allowedBlocksIps —

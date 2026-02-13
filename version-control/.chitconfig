@@ -4,16 +4,13 @@
     "ordering": "strict"
   },
   "filters": {
-    "ignore": [],
+    "ignore": ["src/img/**"],
     "allow": [
-      "public/**",
       "src/**",
-      "views/**",
-      ".env",
-      "safe_scan.js",
-      "server.js",
-      "iterateBlocks.js",
-      "validate_ip.js"
+      "package.json",
+      "package-lock.json",
+      "version-control/**",
+      ".env"
     ]
   }
 }

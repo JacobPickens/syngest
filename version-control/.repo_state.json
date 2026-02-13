@@ -1,0 +1,51 @@
+{
+  "active": {
+    "version": "v0.3.0",
+    "toolchainVersion": "v1.2.0",
+    "appliedAt": "2026-02-08T04:01:52.239Z",
+    "fileCount": 46
+  },
+  "history": [
+    {
+      "version": "v0.0.1",
+      "appliedAt": "2026-02-02T18:44:29.887Z",
+      "fileCount": 24
+    },
+    {
+      "version": "v0.2.4",
+      "toolchainVersion": "v1.2.0",
+      "appliedAt": "2026-02-03T01:30:24.761Z",
+      "fileCount": 37
+    },
+    {
+      "version": "v0.2.5",
+      "toolchainVersion": "v1.2.0",
+      "appliedAt": "2026-02-03T01:51:36.462Z",
+      "fileCount": 37
+    },
+    {
+      "version": "v0.2.5",
+      "toolchainVersion": "v1.2.0",
+      "appliedAt": "2026-02-03T02:09:56.837Z",
+      "fileCount": 37
+    },
+    {
+      "version": "v0.2.7",
+      "toolchainVersion": "v1.2.0",
+      "appliedAt": "2026-02-03T07:22:01.123Z",
+      "fileCount": 46
+    },
+    {
+      "version": "v0.2.9",
+      "toolchainVersion": "v1.2.0",
+      "appliedAt": "2026-02-08T03:38:48.796Z",
+      "fileCount": 46
+    },
+    {
+      "version": "v0.3.0",
+      "toolchainVersion": "v1.2.0",
+      "appliedAt": "2026-02-08T04:01:52.239Z",
+      "fileCount": 46
+    }
+  ]
+}

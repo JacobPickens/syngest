@@ -5,10 +5,26 @@ const fs = require('fs');
 const path = require('path');
 
 // Plain-text run output (one console line == one file line)
-const OUTPUT_TXT_PATH = process.env.RUN_OUTPUT_TXT_PATH || path.resolve('./runOutput.txt');
+// This module can be required from anywhere (server started from src/, project root, etc.).
+// Default paths must always resolve to the project root.
+// __dirname is: <project>/src/lib
+const PROJECT_ROOT = path.resolve(__dirname, '..', '..');
+
+// All runtime artifacts should live in <project>/bin
+const BIN_DIR = path.join(PROJECT_ROOT, 'bin');
+
+const OUTPUT_TXT_PATH = process.env.RUN_OUTPUT_TXT_PATH
+  ? (path.isAbsolute(process.env.RUN_OUTPUT_TXT_PATH)
+      ? process.env.RUN_OUTPUT_TXT_PATH
+      : path.resolve(PROJECT_ROOT, process.env.RUN_OUTPUT_TXT_PATH))
+  : path.join(BIN_DIR, 'runOutput.txt');
 
 // Small JSON state for status/meta/stats (NOT a log)
-const STATE_PATH = process.env.RUN_STATE_PATH || path.resolve('./runState.json');
+const STATE_PATH = process.env.RUN_STATE_PATH
+  ? (path.isAbsolute(process.env.RUN_STATE_PATH)
+      ? process.env.RUN_STATE_PATH
+      : path.resolve(PROJECT_ROOT, process.env.RUN_STATE_PATH))
+  : path.join(BIN_DIR, 'runState.json');
 
 const MAX_STATE_BYTES = Number(process.env.RUN_STATE_MAX_BYTES || 64 * 1024);
 

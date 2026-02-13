@@ -1,3 +1,0 @@
-[dashboard] starting scan: node safe_scan.js
-[dashboard] scan ended: code=1 signal=null error=spawn bash ENOENT
-[dashboard] scan ended: code=-4058 signal=null
